@@ -1,0 +1,128 @@
+#!/Users/rlozano/scripts/llms/simple/venv/bin/python3
+import sys
+import os
+import importlib.util
+import ollama
+import logging
+import json
+
+# Set logging levels to reduce noise
+logging.getLogger("duckduckgo_search").setLevel(logging.WARNING)
+logging.getLogger("youtube_transcript_api").setLevel(logging.ERROR)
+
+MODEL_NAME = 'granite4:7b-a1b-h'
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+SKILLS_DIR = os.path.join(BASE_DIR, "skills")
+TOOLS_DIR = os.path.join(BASE_DIR, "tools")
+
+def load_tools():
+    """Loads schemas and functions from the tools/ directory."""
+    tool_schemas = []
+    tool_functions = {}
+    if os.path.exists(TOOLS_DIR):
+        for f in os.listdir(TOOLS_DIR):
+            if f.endswith('.py') and f != '__init__.py':
+                module_name = f[:-3]
+                spec = importlib.util.spec_from_file_location(module_name, os.path.join(TOOLS_DIR, f))
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                
+                if hasattr(module, 'SCHEMA'):
+                    # Ensure the tool name in schema matches the filename for consistent lookup
+                    module.SCHEMA['function']['name'] = module_name
+                    tool_schemas.append(module.SCHEMA)
+                
+                if hasattr(module, 'execute'):
+                    tool_functions[module_name] = module.execute
+    return tool_schemas, tool_functions
+
+def main():
+    piped_content = sys.stdin.read() if not sys.stdin.isatty() else ""
+    manual_args = " ".join(sys.argv[1:])
+    
+    # Load available tools
+    tool_schemas, tool_functions = load_tools()
+
+    system_prompt = (
+        "You are a local development assistant. "
+        "IMPORTANT: You have tools to see the real filesystem and fetch external data like YouTube transcripts. "
+        "Do not guess filenames or content. Use your tools to verify facts. "
+        "If you use a tool, wait for the tool output before giving a final answer."
+    )
+
+    # Initial user message construction
+    user_input = manual_args + (f"\n\nCONTEXT:\n{piped_content}" if piped_content else "")
+    
+    if not user_input.strip():
+        print("Error: No input provided. Please provide a prompt or pipe content to the script.")
+        return
+
+    messages = [
+        {'role': 'system', 'content': system_prompt},
+        {'role': 'user', 'content': user_input}
+    ]
+
+    try:
+        # THE AGENT LOOP
+        while True:
+            # Call Ollama with the current message history and tool definitions
+            response = ollama.chat(
+                model=MODEL_NAME, 
+                messages=messages, 
+                tools=tool_schemas
+            )
+
+            # Add the model's response (which may be a tool call or a final answer)
+            messages.append(response.message)
+
+            # If the model didn't call any tools, it's done—print result and exit
+            if not response.message.tool_calls:
+                if response.message.content:
+                    print(response.message.content)
+                else:
+                    print("Model returned an empty response.")
+                break
+
+            # Process tool calls if present
+            for tool in response.message.tool_calls:
+                func_name = tool.function.name
+                args = tool.function.arguments
+
+                # Ensure arguments are a dictionary (Ollama sometimes returns JSON strings)
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except json.JSONDecodeError:
+                        print(f"Error decoding JSON for tool {func_name}", file=sys.stderr)
+                        args = {}
+
+                if func_name in tool_functions:
+                    # Provide visual feedback in the terminal
+                    # print(f"[*] Calling tool: {func_name}({args})", file=sys.stderr)
+                    
+                    try:
+                        # Execute the tool function
+                        result = tool_functions[func_name](**args)
+                        
+                        # Append the tool result to the conversation
+                        # Role 'tool' is required for the model to recognize the feedback
+                        messages.append({
+                            'role': 'tool', 
+                            'content': str(result),
+                            'name': func_name
+                        })
+                    except Exception as tool_err:
+                        error_msg = f"Tool Execution Error ({func_name}): {str(tool_err)}"
+                        messages.append({'role': 'tool', 'content': error_msg, 'name': func_name})
+                else:
+                    error_msg = f"Error: Tool '{func_name}' is not registered in tool_functions."
+                    messages.append({'role': 'tool', 'content': error_msg, 'name': func_name})
+
+            # The loop repeats, sending the tool outputs back to the model for final synthesis
+
+    except Exception as e:
+        print(f"CRITICAL ERROR: {e}", file=sys.stderr)
+
+if __name__ == "__main__":
+    main()

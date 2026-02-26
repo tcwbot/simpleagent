@@ -1,0 +1,67 @@
+total 32
+-rw-r--r--@ 1 rlozano  staff     0 Feb 25 11:42 context
+-rwxr-xr-x@ 1 rlozano  staff  2674 Feb 25 11:40 lm
+-rw-r--r--@ 1 rlozano  staff   868 Feb 25 11:34 README.md
+-rw-r--r--@ 1 rlozano  staff     7 Feb 25 10:47 requirements.txt
+-rw-r--r--@ 1 rlozano  staff   368 Feb 25 10:50 simple.py
+drwxr-xr-x@ 4 rlozano  staff   128 Feb 25 11:03 skills
+drwxr-xr-x@ 3 rlozano  staff    96 Feb 25 11:40 tools
+drwxr-xr-x@ 6 rlozano  staff   192 Feb 25 10:46 venv
+README.md
+### 🚀 Getting Started
+
+1. **Install Dependencies**
+
+```bash
+pip install ollama python-dotenv  # optional for env vars if needed later
+```
+
+2. **Place Skills**
+Create markdown files inside the `skills/` directory. Example: `skills/git_commit.md`.
+
+3. **Run the Script**
+From terminal, either provide input via piped content or specify arguments:
+
+```bash
+# Simple manual prompt example
+python script.py "Explain the benefits of using a hybrid Mamba architecture."
+
+# Piped diff for git commit generation
+git diff HEAD^1 HEAD | python script.py
+```
+
+4. **Optional: Add More Skills**
+Just drop additional `.md` files into `skills/`. The system will automatically load and incorporate them.
+
+### 🤝 Contributing
+
+Feel free to contribute by adding more skills or improving existing ones! Follow the [commit-bot](#commit-bot) formatting rules strictly for consistency.
+--- ls -l tools
+total 8
+-rw-r--r--@ 1 rlozano  staff  784 Feb 25 11:40 web_search.py
+import requests
+from duckduckgo_search import DDGS
+
+# This is the schema Ollama needs to understand the tool
+SCHEMA = {
+    'type': 'function',
+    'function': {
+        'name': 'web_search',
+        'description': 'Search the internet for current events or specific facts',
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'query': {'type': 'string', 'description': 'The search term'},
+            },
+            'required': ['query'],
+        },
+    },
+}
+
+# This is the actual execution logic
+def execute(query: str):
+    results = []
+    with DDGS() as ddgs:
+        for r in ddgs.text(query, max_results=3):
+            results.append(f"Title: {r['title']}\nSnippet: {r['body']}\nURL: {r['href']}")
+    return "\n\n".join(results)

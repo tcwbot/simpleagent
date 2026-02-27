@@ -20,7 +20,7 @@ pip install ollama duckduckgo-search beautifulsoup4
 Add this to your `.zshrc` or `.bashrc` so you can call the agent from anywhere:
 
 ```bash
-alias lm='/Users/USERNAME/scripts/llms/simple/venv/bin/python3 /Users/USERNAME/scripts/llms/simple/lm'
+alias lm='/Users/rlozano/scripts/llms/simple/venv/bin/python3 /Users/rlozano/scripts/llms/simple/lm'
 
 ```
 

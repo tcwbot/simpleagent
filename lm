@@ -38,10 +38,22 @@ def load_tools():
     return tool_schemas, tool_functions
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description='A local AI agent powered by Ollama with web search & file tools.',
+        epilog='''
+Usage examples:
+  lm "list files in current dir"
+  git diff | lm "write a commit message"
+  cat file.py | lm "explain this code"
+''',
+        formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--thinking', '-t', action='store_true', help='Show thinking/reasoning stages')
     parser.add_argument('prompt', nargs='*', help='Prompt to send to the model')
     parsed_args = parser.parse_args()
+
+    if not parsed_args.prompt:
+        parser.print_help()
+        return
 
     piped_content = sys.stdin.read() if not sys.stdin.isatty() else ""
     manual_args = " ".join(parsed_args.prompt)

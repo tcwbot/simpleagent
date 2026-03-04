@@ -1,3 +1,4 @@
+import argparse
 import sys
 import os
 import importlib.util
@@ -37,8 +38,13 @@ def load_tools():
     return tool_schemas, tool_functions
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--thinking', '-t', action='store_true', help='Show thinking/reasoning stages')
+    parser.add_argument('prompt', nargs='*', help='Prompt to send to the model')
+    parsed_args = parser.parse_args()
+
     piped_content = sys.stdin.read() if not sys.stdin.isatty() else ""
-    manual_args = " ".join(sys.argv[1:])
+    manual_args = " ".join(parsed_args.prompt)
     
     # Load available tools
     tool_schemas, tool_functions = load_tools()
@@ -88,35 +94,45 @@ def main():
                 func_name = tool.function.name
                 args = tool.function.arguments
 
-                # Ensure arguments are a dictionary (Ollama sometimes returns JSON strings)
-                if isinstance(args, str):
-                    try:
-                        args = json.loads(args)
-                    except json.JSONDecodeError:
-                        print(f"Error decoding JSON for tool {func_name}", file=sys.stderr)
-                        args = {}
+                # Show thinking if available
+                if parsed_args.thinking:
+                    thinking = getattr(response.message, 'thinking', None) or getattr(response.message, 'reasoning', None)
+                    if thinking:
+                        print(f"💭 {thinking}\n")
 
-                if func_name in tool_functions:
-                    # Provide visual feedback in the terminal
-                    # print(f"[*] Calling tool: {func_name}({args})", file=sys.stderr)
-                    
-                    try:
-                        # Execute the tool function
-                        result = tool_functions[func_name](**args)
+                    # Show tool call
+                    print(f"🔧 → {func_name}({args})\n")
+
+                    # Ensure arguments are a dictionary (Ollama sometimes returns JSON strings)
+                    if isinstance(args, str):
+                        try:
+                            args = json.loads(args)
+                        except json.JSONDecodeError:
+                            print(f"Error decoding JSON for tool {func_name}", file=sys.stderr)
+                            args = {}
+
+                    if func_name in tool_functions:
+                        # Provide visual feedback in the terminal
+                        # print(f"[*] Calling tool: {func_name}({args})", file=sys.stderr)
                         
-                        # Append the tool result to the conversation
-                        # Role 'tool' is required for the model to recognize the feedback
-                        messages.append({
-                            'role': 'tool', 
-                            'content': str(result),
-                            'name': func_name
-                        })
-                    except Exception as tool_err:
-                        error_msg = f"Tool Execution Error ({func_name}): {str(tool_err)}"
+                        try:
+                            # Execute the tool function
+                            result = tool_functions[func_name](**args)
+                            
+                            # Append the tool result to the conversation
+                            # Role 'tool' is required for the model to recognize the feedback
+                            messages.append({
+                                'role': 'tool', 
+                                'content': str(result),
+                                'name': func_name
+                            })
+                            print(f"📄 Result: {str(result)[:200]}..." if len(str(result)) > 200 else f"📄 Result: {str(result)}")
+                        except Exception as tool_err:
+                            error_msg = f"Tool Execution Error ({func_name}): {str(tool_err)}"
+                            messages.append({'role': 'tool', 'content': error_msg, 'name': func_name})
+                    else:
+                        error_msg = f"Error: Tool '{func_name}' is not registered in tool_functions."
                         messages.append({'role': 'tool', 'content': error_msg, 'name': func_name})
-                else:
-                    error_msg = f"Error: Tool '{func_name}' is not registered in tool_functions."
-                    messages.append({'role': 'tool', 'content': error_msg, 'name': func_name})
 
             # The loop repeats, sending the tool outputs back to the model for final synthesis
 

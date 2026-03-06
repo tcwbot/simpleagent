@@ -68,6 +68,18 @@ lm "What are the latest benchmarks for the Granite 4 model?"
 
 ```
 
+###**Agent Swarms **
+
+```bash
+ python3 lm --swarm --tui --endpoint ollama --model granite4:7b-a1b-h --swarm-workers 3 --swarm-max-reviews 3 --tool-timeout 90 --output-format markdown "Audit this repo for reliability issues. Identify top 5 failure modes and prioritized fixes."
+
+```
+![TUI Screenshot](./docs/images/tui-screenshot.png)
+
+
+
+
+
 ---
 
 ## 🤝 Contributing

@@ -79,6 +79,30 @@ def call_ollama_with_timeout(model_name, messages, timeout_sec):
         return future.result(timeout=timeout_sec)
 
 
+def get_response_field(response, field_name, default=None):
+    """Safely read fields from Ollama response objects or dict-like responses."""
+    if response is None:
+        return default
+    value = getattr(response, field_name, None)
+    if value is not None:
+        return value
+    if isinstance(response, dict):
+        return response.get(field_name, default)
+    return default
+
+
+def extract_token_usage(response):
+    """Extract token counters from Ollama response if available."""
+    prompt_tokens = get_response_field(response, "prompt_eval_count", 0) or 0
+    completion_tokens = get_response_field(response, "eval_count", 0) or 0
+    total_tokens = int(prompt_tokens) + int(completion_tokens)
+    return {
+        "prompt_tokens": int(prompt_tokens),
+        "completion_tokens": int(completion_tokens),
+        "total_tokens": int(total_tokens),
+    }
+
+
 def emit_worker_error(event_queue, agent_id, role, error_type, details, **extra):
     """Emit a normalized error event for worker/coordinator observability."""
     payload = {
@@ -233,6 +257,7 @@ class SwarmTui:
                 "last_heartbeat": None,
                 "heartbeat_count": 0,
                 "last_seen": now,
+                "total_tokens": 0,
             }
             for agent_id in agent_ids
         }
@@ -240,6 +265,9 @@ class SwarmTui:
         self.reasoning = {agent_id: [] for agent_id in agent_ids}
         self.view_mode = "dashboard"
         self._view_order = ["dashboard", "reasoning", "events", "processes"]
+        self.token_totals = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        self.request_count = 0
+        self.error_count = 0
 
     def _event_line(self, event):
         event_name = event.get("event", "unknown")
@@ -292,6 +320,7 @@ class SwarmTui:
                 "last_heartbeat": None,
                 "heartbeat_count": 0,
                 "last_seen": now,
+                "total_tokens": 0,
             }
 
         if agent_id:
@@ -328,12 +357,26 @@ class SwarmTui:
                     "last_heartbeat": None,
                     "heartbeat_count": 0,
                     "last_seen": now,
+                    "total_tokens": 0,
                 },
             )
             proc["role"] = worker.spec.role
             proc["pid"] = pid
             proc["state"] = worker.state
             proc["restarts"] = worker.restarts
+
+        if agent_id:
+            pt = int(event.get("prompt_tokens", 0) or 0)
+            ct = int(event.get("completion_tokens", 0) or 0)
+            tt = int(event.get("total_tokens", 0) or 0)
+            if tt > 0:
+                self.request_count += 1
+                self.processes[agent_id]["total_tokens"] += tt
+                self.token_totals["prompt_tokens"] += pt
+                self.token_totals["completion_tokens"] += ct
+                self.token_totals["total_tokens"] += tt
+            if event.get("event") == "worker_error":
+                self.error_count += 1
 
         if event.get("event") != "heartbeat":
             self.events.append(self._event_line(event))
@@ -342,7 +385,12 @@ class SwarmTui:
     def render(self):
         now = time.time()
         header = Panel(
-            f"Endpoint: {self.endpoint_name}    Model: {self.model_name}    View: {self.view_mode}",
+            (
+                f"Endpoint: {self.endpoint_name}    Model: {self.model_name}    View: {self.view_mode}"
+                f"    Tokens: {self.token_totals['total_tokens']} "
+                f"(prompt {self.token_totals['prompt_tokens']}, completion {self.token_totals['completion_tokens']})"
+                f"    Requests: {self.request_count}    Errors: {self.error_count}"
+            ),
             title="Swarm Runtime",
             border_style="green",
         )
@@ -354,6 +402,7 @@ class SwarmTui:
         proc_table.add_column("State")
         proc_table.add_column("Restarts")
         proc_table.add_column("Heartbeat Age")
+        proc_table.add_column("Tokens")
         for agent_id in sorted(self.processes.keys()):
             info = self.processes[agent_id]
             hb = info.get("last_heartbeat")
@@ -365,6 +414,7 @@ class SwarmTui:
                 str(info.get("state", "unknown")),
                 str(info.get("restarts", 0)),
                 hb_age,
+                str(info.get("total_tokens", 0)),
             )
 
         hb_table = Table(title="Heartbeats", expand=True)
@@ -472,6 +522,7 @@ def swarm_planner_worker(
 ):
     emit_event(event_queue, "worker_progress", agent_id="planner-1", role="planner", msg="planning_started")
     tasks = []
+    planner_tokens = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     try:
         response = call_ollama_with_timeout(
             model_name,
@@ -487,6 +538,7 @@ def swarm_planner_worker(
             ],
             model_timeout_sec,
         )
+        planner_tokens = extract_token_usage(response)
         content = (response.message.content or "").strip()
         parsed = parse_json_payload(content)
         if isinstance(parsed, list):
@@ -533,6 +585,9 @@ def swarm_planner_worker(
         msg="planning_completed",
         task_count=task_count,
         summary=f"Planned {task_count} task(s): {', '.join(tasks[:3])}",
+        prompt_tokens=planner_tokens["prompt_tokens"],
+        completion_tokens=planner_tokens["completion_tokens"],
+        total_tokens=planner_tokens["total_tokens"],
     )
 
     # Keep process alive so heartbeat tracking remains visible until shutdown.
@@ -579,6 +634,7 @@ def swarm_worker_worker(
                 ],
                 model_timeout_sec,
             )
+            worker_tokens = extract_token_usage(response)
             output = (response.message.content or "").strip()
             result_queue.put(
                 {
@@ -596,6 +652,9 @@ def swarm_worker_worker(
                 task_id=task_id,
                 msg="task_completed",
                 summary=short_text(output, max_len=180),
+                prompt_tokens=worker_tokens["prompt_tokens"],
+                completion_tokens=worker_tokens["completion_tokens"],
+                total_tokens=worker_tokens["total_tokens"],
             )
         except TimeoutError:
             error_payload = {
@@ -667,6 +726,7 @@ def swarm_critic_worker(
             "follow_up_tasks": [],
             "schema_invalid": False,
         }
+        critic_tokens = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         try:
             response = call_ollama_with_timeout(
                 model_name,
@@ -689,6 +749,10 @@ def swarm_critic_worker(
                 ],
                 model_timeout_sec,
             )
+            usage = extract_token_usage(response)
+            critic_tokens["prompt_tokens"] += usage["prompt_tokens"]
+            critic_tokens["completion_tokens"] += usage["completion_tokens"]
+            critic_tokens["total_tokens"] += usage["total_tokens"]
             content = (response.message.content or "").strip()
             parsed = parse_json_payload(content)
             normalized = normalize_critic_review_payload(parsed)
@@ -715,6 +779,10 @@ def swarm_critic_worker(
                     ],
                     model_timeout_sec,
                 )
+                retry_usage = extract_token_usage(retry_response)
+                critic_tokens["prompt_tokens"] += retry_usage["prompt_tokens"]
+                critic_tokens["completion_tokens"] += retry_usage["completion_tokens"]
+                critic_tokens["total_tokens"] += retry_usage["total_tokens"]
                 retry_content = (retry_response.message.content or "").strip()
                 retry_parsed = parse_json_payload(retry_content)
                 normalized_retry = normalize_critic_review_payload(retry_parsed)
@@ -758,6 +826,9 @@ def swarm_critic_worker(
                 f"status={review_payload.get('status')} feedback={review_payload.get('feedback', '')}",
                 max_len=180,
             ),
+            prompt_tokens=critic_tokens["prompt_tokens"],
+            completion_tokens=critic_tokens["completion_tokens"],
+            total_tokens=critic_tokens["total_tokens"],
         )
 
 
@@ -790,6 +861,7 @@ def swarm_synthesizer_worker(
         )
 
         payload = {"status": "error", "final_answer": "", "details": "No synthesis generated."}
+        synth_tokens = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         try:
             response = call_ollama_with_timeout(
                 model_name,
@@ -812,6 +884,7 @@ def swarm_synthesizer_worker(
                 ],
                 model_timeout_sec,
             )
+            synth_tokens = extract_token_usage(response)
             content = (response.message.content or "").strip()
             parsed = parse_json_payload(content)
             normalized = normalize_synth_payload(parsed)
@@ -854,6 +927,9 @@ def swarm_synthesizer_worker(
                 payload.get("details") or payload.get("final_answer", ""),
                 max_len=180,
             ),
+            prompt_tokens=synth_tokens["prompt_tokens"],
+            completion_tokens=synth_tokens["completion_tokens"],
+            total_tokens=synth_tokens["total_tokens"],
         )
 
 

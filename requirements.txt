@@ -3,6 +3,5 @@ requests
 ddgs
 logging
 curl_cffi
-safari_16
 youtube-transcript-api
 rich

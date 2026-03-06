@@ -28,6 +28,8 @@ python3 lm --swarm --tui --endpoint ollama --model granite4:7b-a1b-h --swarm-wor
 - `--swarm`: use swarm coordinator instead of the single agent loop.
 - `--tui`: show grouped dashboard with process table, heartbeat table, and recent event stream (requires `rich`).
   Includes a `Reasoning` panel with per-agent reasoning summaries emitted at key steps.
+  Shows live token usage totals in the header and per-agent token totals in the process table.
+  Header also shows request count (successful model calls) and worker error count.
   Keybindings: `Tab` cycles views, `r` reasoning, `e` events, `p` processes, `d` dashboard, `q` quit.
 - `--endpoint`: inference backend label (currently only `ollama` is implemented).
 - `--model`: model name used for all swarm stages.

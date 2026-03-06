@@ -5,16 +5,52 @@ import importlib.util
 import ollama
 import logging
 import json
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 
 # Set logging levels to reduce noise
 sys.stderr = open(os.devnull,"w")
 os.environ["CURL_CFFI_LOG_LEVEL"] = "error"
 
 MODEL_NAME = 'granite4:7b-a1b-h'
+DEFAULT_MAX_STEPS = 12
+DEFAULT_TOOL_TIMEOUT_SEC = 20
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SKILLS_DIR = os.path.join(BASE_DIR, "skills")
 TOOLS_DIR = os.path.join(BASE_DIR, "tools")
+
+
+def short_text(value, max_len=240):
+    text = str(value).strip()
+    if len(text) <= max_len:
+        return text
+    return text[:max_len] + "..."
+
+
+def extract_debug_lines(message):
+    """Extract compact debug lines from model fields/content."""
+    lines = []
+
+    thinking = getattr(message, 'thinking', None) or getattr(message, 'reasoning', None)
+    if thinking:
+        lines.append(f"reasoning: {short_text(thinking)}")
+
+    content = (getattr(message, 'content', None) or "").strip()
+    if not content:
+        return lines
+
+    # If model follows optional bracketed debug sections, surface them first.
+    for label in ("PLAN", "SELF_CHECK", "NEXT_ACTION", "VERIFY"):
+        marker = f"[{label}]"
+        for raw_line in content.splitlines():
+            line = raw_line.strip()
+            if line.startswith(marker):
+                lines.append(f"{label.lower()}: {short_text(line[len(marker):].strip())}")
+
+    if not lines:
+        lines.append(f"content: {short_text(content)}")
+
+    return lines
 
 def load_tools():
     """Loads schemas and functions from the tools/ directory."""
@@ -47,7 +83,9 @@ Usage examples:
   cat file.py | lm "explain this code"
 ''',
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('--thinking', '-t', action='store_true', help='Show thinking/reasoning stages')
+    parser.add_argument('--debug', '-d', action='store_true', help='Show debug output (reasoning and tool calls)')
+    parser.add_argument('--max-steps', type=int, default=DEFAULT_MAX_STEPS, help='Maximum agent loop iterations')
+    parser.add_argument('--tool-timeout', type=int, default=DEFAULT_TOOL_TIMEOUT_SEC, help='Per-tool timeout in seconds')
     parser.add_argument('prompt', nargs='*', help='Prompt to send to the model')
     parsed_args = parser.parse_args()
 
@@ -67,6 +105,11 @@ Usage examples:
         "Do not guess filenames or content. Use your tools to verify facts. "
         "If you use a tool, wait for the tool output before giving a final answer."
     )
+    if parsed_args.debug:
+        system_prompt += (
+            " In debug mode, include compact trace lines in your responses when relevant: "
+            "[PLAN], [SELF_CHECK], [NEXT_ACTION], and [VERIFY]."
+        )
 
     # Initial user message construction
     user_input = manual_args + (f"\n\nCONTEXT:\n{piped_content}" if piped_content else "")
@@ -82,7 +125,9 @@ Usage examples:
 
     try:
         # THE AGENT LOOP
-        while True:
+        step = 0
+        while step < parsed_args.max_steps:
+            step += 1
             # Call Ollama with the current message history and tool definitions
             response = ollama.chat(
                 model=MODEL_NAME, 
@@ -92,6 +137,11 @@ Usage examples:
 
             # Add the model's response (which may be a tool call or a final answer)
             messages.append(response.message)
+
+            if parsed_args.debug:
+                print(f"STEP {step}")
+                for line in extract_debug_lines(response.message):
+                    print(f"  {line}")
 
             # If the model didn't call any tools, it's done—print result and exit
             if not response.message.tool_calls:
@@ -106,47 +156,84 @@ Usage examples:
                 func_name = tool.function.name
                 args = tool.function.arguments
 
-                # Show thinking if available
-                if parsed_args.thinking:
-                    thinking = getattr(response.message, 'thinking', None) or getattr(response.message, 'reasoning', None)
-                    if thinking:
-                        print(f"💭 {thinking}\n")
-
-                    # Show tool call
-                    print(f"🔧 → {func_name}({args})\n")
-
-                    # Ensure arguments are a dictionary (Ollama sometimes returns JSON strings)
-                    if isinstance(args, str):
-                        try:
-                            args = json.loads(args)
-                        except json.JSONDecodeError:
-                            print(f"Error decoding JSON for tool {func_name}", file=sys.stderr)
-                            args = {}
-
-                    if func_name in tool_functions:
-                        # Provide visual feedback in the terminal
-                        # print(f"[*] Calling tool: {func_name}({args})", file=sys.stderr)
-                        
-                        try:
-                            # Execute the tool function
-                            result = tool_functions[func_name](**args)
-                            
-                            # Append the tool result to the conversation
-                            # Role 'tool' is required for the model to recognize the feedback
-                            messages.append({
-                                'role': 'tool', 
-                                'content': str(result),
-                                'name': func_name
-                            })
-                            print(f"📄 Result: {str(result)[:200]}..." if len(str(result)) > 200 else f"📄 Result: {str(result)}")
-                        except Exception as tool_err:
-                            error_msg = f"Tool Execution Error ({func_name}): {str(tool_err)}"
-                            messages.append({'role': 'tool', 'content': error_msg, 'name': func_name})
-                    else:
-                        error_msg = f"Error: Tool '{func_name}' is not registered in tool_functions."
+                # Ensure arguments are a dictionary (Ollama sometimes returns JSON strings)
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except json.JSONDecodeError:
+                        error_msg = f"Invalid JSON arguments for tool '{func_name}'."
                         messages.append({'role': 'tool', 'content': error_msg, 'name': func_name})
+                        if parsed_args.debug:
+                            print(f"  tool_call: {func_name}({short_text(tool.function.arguments)})")
+                            print(f"  tool_error: {short_text(error_msg)}")
+                        continue
+
+                if not isinstance(args, dict):
+                    error_msg = f"Invalid argument payload for tool '{func_name}': expected object/dict."
+                    messages.append({'role': 'tool', 'content': error_msg, 'name': func_name})
+                    if parsed_args.debug:
+                        print(f"  tool_call: {func_name}({short_text(args)})")
+                        print(f"  tool_error: {short_text(error_msg)}")
+                    continue
+
+                if parsed_args.debug:
+                    print(f"  tool_call: {func_name}({short_text(args)})")
+
+                if func_name in tool_functions:
+                    try:
+                        with ThreadPoolExecutor(max_workers=1) as pool:
+                            future = pool.submit(tool_functions[func_name], **args)
+                            result = future.result(timeout=parsed_args.tool_timeout)
+
+                        # Append the tool result to the conversation.
+                        messages.append({
+                            'role': 'tool',
+                            'content': str(result),
+                            'name': func_name
+                        })
+                        if parsed_args.debug:
+                            print(f"  tool_result: {short_text(result)}")
+                    except TimeoutError:
+                        error_msg = json.dumps({
+                            "error": "tool_timeout",
+                            "tool": func_name,
+                            "details": f"Tool timed out after {parsed_args.tool_timeout}s"
+                        })
+                        messages.append({'role': 'tool', 'content': error_msg, 'name': func_name})
+                        if parsed_args.debug:
+                            print(f"  tool_error: {short_text(error_msg)}")
+                    except Exception as tool_err:
+                        error_msg = json.dumps({
+                            "error": "tool_execution_error",
+                            "tool": func_name,
+                            "details": str(tool_err)
+                        })
+                        messages.append({'role': 'tool', 'content': error_msg, 'name': func_name})
+                        if parsed_args.debug:
+                            print(f"  tool_error: {short_text(error_msg)}")
+                else:
+                    error_msg = json.dumps({
+                        "error": "tool_not_registered",
+                        "tool": func_name,
+                        "details": "Tool is not registered in tool_functions."
+                    })
+                    messages.append({'role': 'tool', 'content': error_msg, 'name': func_name})
+                    if parsed_args.debug:
+                        print(f"  tool_error: {short_text(error_msg)}")
 
             # The loop repeats, sending the tool outputs back to the model for final synthesis
+            if parsed_args.debug:
+                messages.append({
+                    'role': 'user',
+                    'content': (
+                        "DEBUG CHECK: Evaluate the latest tool outputs before your next action. "
+                        "State [VERIFY] sufficient/insufficient with one reason. "
+                        "If insufficient, continue with the next best tool call. "
+                        "If sufficient, provide the final answer."
+                    )
+                })
+        else:
+            print(f"Stopped after reaching max steps ({parsed_args.max_steps}).", file=sys.stderr)
 
     except Exception as e:
         print(f"CRITICAL ERROR: {e}", file=sys.stderr)

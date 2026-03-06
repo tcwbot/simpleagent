@@ -39,6 +39,7 @@ Drop `.py` files here to give the agent "powers." If a tool is present, the agen
 * **Search the web** (via DuckDuckGo).
 * **List directories** (to see what files you have).
 * **Read files** (to analyze your code).
+* **Write files** safely inside the current working directory (with overwrite confirmation).
 
 ---
 

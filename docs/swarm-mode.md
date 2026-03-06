@@ -16,6 +16,7 @@ python3 lm --swarm --tui --endpoint ollama --model granite4:7b-a1b-h --swarm-wor
 - Starts `planner-1`, `worker-N`, `critic-1`, and `synthesizer-1` processes.
 - Planner breaks your prompt into up to 5 tasks.
 - Workers consume tasks concurrently and return per-task results.
+- Worker tasks run through a tool-calling loop, so file-creation/update prompts can execute real writes via tools (for example `write_file`).
 - Critic evaluates the collected worker results and gates final output (`pass|fail`).
 - On critic `fail`, critic can return `follow_up_tasks`; coordinator enqueues them and reruns workers, then re-reviews.
 - Synthesizer builds one cohesive final response from critic-approved outputs.

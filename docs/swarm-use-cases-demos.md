@@ -133,3 +133,35 @@ python3 lm --swarm --tui --endpoint ollama --model granite4:7b-a1b-h --swarm-wor
 ```
 
 Use this mode when you want live process/heartbeat/event visibility with keyboard shortcuts.
+
+## App Build Use Cases
+
+### A) FastAPI CRUD App
+
+```bash
+$BASE "Build a minimal FastAPI app in this repo with health check, CRUD for notes, and pytest tests; create all files and update docs with run instructions."
+```
+
+### B) CLI Todo App
+
+```bash
+$BASE "Create a CLI todo app (Python) with add/list/done/delete commands, persistent JSON storage, unit tests, and a README usage section."
+```
+
+### C) Dashboard App for Process Events
+
+```bash
+$BASE "Scaffold a small web dashboard app with a backend API and simple frontend page that displays live process-events.jsonl metrics; include tests and docs."
+```
+
+### D) Local Docs Research Assistant
+
+```bash
+$BASE "Build an internal research assistant module that ingests local markdown docs, supports keyword search, and returns summarized answers with source file references; add tests."
+```
+
+### E) Production-Ready Starter Template
+
+```bash
+$BASE "Implement a production-ready starter app template in this repo: config loader, structured logging, error handling middleware, health endpoints, CI test workflow checks, and documentation."
+```

@@ -92,10 +92,13 @@ def extract_debug_lines(message):
     return lines
 
 
-def call_ollama_with_timeout(model_name, messages, timeout_sec):
+def call_ollama_with_timeout(model_name, messages, timeout_sec, tools=None):
     """Run an Ollama chat call with a hard timeout."""
+    kwargs = {"model": model_name, "messages": messages}
+    if tools is not None:
+        kwargs["tools"] = tools
     with ThreadPoolExecutor(max_workers=1) as pool:
-        future = pool.submit(ollama.chat, model=model_name, messages=messages)
+        future = pool.submit(ollama.chat, **kwargs)
         return future.result(timeout=timeout_sec)
 
 
@@ -261,6 +264,107 @@ def build_swarm_output_payload(parsed_args, prompt_text, critic_review, synth_re
     output_payload["error"] = f"Swarm mode stopped after max steps ({parsed_args.max_steps}) without a final result."
     output_payload["error_type"] = "timeout"
     return output_payload
+
+
+def extract_message_content(message):
+    if message is None:
+        return ""
+    value = getattr(message, "content", None)
+    if value is not None:
+        return value or ""
+    if isinstance(message, dict):
+        return message.get("content", "") or ""
+    return ""
+
+
+def extract_message_tool_calls(message):
+    if message is None:
+        return []
+    value = getattr(message, "tool_calls", None)
+    if value is not None:
+        return value or []
+    if isinstance(message, dict):
+        return message.get("tool_calls", []) or []
+    return []
+
+
+def extract_tool_call_name_and_args(tool_call):
+    fn = getattr(tool_call, "function", None)
+    if fn is not None:
+        return getattr(fn, "name", None), getattr(fn, "arguments", {})
+    if isinstance(tool_call, dict):
+        fn = tool_call.get("function", {})
+        return fn.get("name"), fn.get("arguments", {})
+    return None, {}
+
+
+def run_worker_task_with_tools(instruction, model_name, system_prompt, timeout_sec, max_steps=8):
+    """Run a worker task with tool-calling loop and aggregate token usage."""
+    tool_schemas, tool_functions = load_tools()
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": instruction},
+    ]
+    usage_totals = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    tool_calls_executed = 0
+    final_content = ""
+
+    for _ in range(max_steps):
+        response = call_ollama_with_timeout(model_name, messages, timeout_sec, tools=tool_schemas)
+        usage = extract_token_usage(response)
+        usage_totals["prompt_tokens"] += usage["prompt_tokens"]
+        usage_totals["completion_tokens"] += usage["completion_tokens"]
+        usage_totals["total_tokens"] += usage["total_tokens"]
+
+        message = getattr(response, "message", None) if response is not None else None
+        if message is None and isinstance(response, dict):
+            message = response.get("message")
+
+        messages.append(message)
+        final_content = (extract_message_content(message) or "").strip()
+        tool_calls = extract_message_tool_calls(message)
+        if not tool_calls:
+            break
+
+        for tool_call in tool_calls:
+            func_name, args = extract_tool_call_name_and_args(tool_call)
+            if not func_name:
+                continue
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except Exception:  # noqa: BLE001
+                    args = {}
+            if not isinstance(args, dict):
+                args = {}
+
+            if func_name not in tool_functions:
+                tool_result = f"Tool '{func_name}' is not registered."
+            else:
+                try:
+                    tool_result = tool_functions[func_name](**args)
+                except Exception as err:  # noqa: BLE001
+                    tool_result = f"Tool execution error for '{func_name}': {err}"
+
+            tool_calls_executed += 1
+            messages.append(
+                {
+                    "role": "tool",
+                    "name": func_name,
+                    "content": str(tool_result),
+                }
+            )
+    else:
+        final_content = (
+            final_content
+            or f"Stopped after max worker reasoning/tool steps ({max_steps}) for instruction: {instruction[:120]}"
+        )
+
+    return {
+        "output": final_content,
+        "tokens": usage_totals,
+        "tool_calls_executed": tool_calls_executed,
+    }
 
 
 def normalize_planned_tasks(parsed, goal):
@@ -712,19 +816,19 @@ def swarm_worker_worker(
             prompt_template_id=prompt_template_id,
         )
         try:
-            response = call_ollama_with_timeout(
-                model_name,
-                [
-                    {
-                        "role": "system",
-                        "content": WORKER_PROMPT_PROFILES[prompt_template_id],
-                    },
-                    {"role": "user", "content": instruction},
-                ],
-                model_timeout_sec,
+            worker_result = run_worker_task_with_tools(
+                instruction=instruction,
+                model_name=model_name,
+                system_prompt=(
+                    WORKER_PROMPT_PROFILES[prompt_template_id]
+                    + " Use available tools when needed. "
+                    "If the task asks for creating/updating files, perform the writes via tools instead of only describing a plan."
+                ),
+                timeout_sec=model_timeout_sec,
+                max_steps=8,
             )
-            worker_tokens = extract_token_usage(response)
-            output = (response.message.content or "").strip()
+            worker_tokens = worker_result["tokens"]
+            output = (worker_result.get("output") or "").strip()
             result_queue.put(
                 {
                     "task_id": task_id,
@@ -732,6 +836,7 @@ def swarm_worker_worker(
                     "output": output,
                     "agent_id": agent_id,
                     "prompt_template_id": prompt_template_id,
+                    "tool_calls_executed": worker_result.get("tool_calls_executed", 0),
                 }
             )
             emit_event(
@@ -743,6 +848,7 @@ def swarm_worker_worker(
                 msg="task_completed",
                 summary=short_text(output, max_len=180),
                 prompt_template_id=prompt_template_id,
+                tool_calls_executed=worker_result.get("tool_calls_executed", 0),
                 prompt_tokens=worker_tokens["prompt_tokens"],
                 completion_tokens=worker_tokens["completion_tokens"],
                 total_tokens=worker_tokens["total_tokens"],

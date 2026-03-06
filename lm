@@ -823,6 +823,8 @@ def swarm_worker_worker(
                     WORKER_PROMPT_PROFILES[prompt_template_id]
                     + " Use available tools when needed. "
                     "If the task asks for creating/updating files, perform the writes via tools instead of only describing a plan."
+                    " Only write paths relative to the current working directory. "
+                    "Never use absolute paths. Call list_dir('.') before creating files to confirm location."
                 ),
                 timeout_sec=model_timeout_sec,
                 max_steps=8,
@@ -1489,6 +1491,9 @@ Usage examples:
     parser.add_argument('--tool-timeout', type=int, default=DEFAULT_TOOL_TIMEOUT_SEC, help='Per-tool timeout in seconds')
     parser.add_argument('prompt', nargs='*', help='Prompt to send to the model')
     parsed_args = parser.parse_args()
+
+    # Lock tool writes to the launch directory (project/workspace root).
+    os.environ["SIMPLEAGENT_WORKSPACE_ROOT"] = os.path.abspath(os.getcwd())
 
     if not parsed_args.prompt:
         parser.print_help()

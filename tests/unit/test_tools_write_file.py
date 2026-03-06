@@ -10,11 +10,16 @@ from tools import write_file
 class WriteFileToolTests(unittest.TestCase):
     def setUp(self):
         self.original_cwd = os.getcwd()
+        self.original_workspace_root = os.environ.get("SIMPLEAGENT_WORKSPACE_ROOT")
         self.tmpdir = tempfile.mkdtemp(prefix="write-file-tool-test-")
         os.chdir(self.tmpdir)
 
     def tearDown(self):
         os.chdir(self.original_cwd)
+        if self.original_workspace_root is None:
+            os.environ.pop("SIMPLEAGENT_WORKSPACE_ROOT", None)
+        else:
+            os.environ["SIMPLEAGENT_WORKSPACE_ROOT"] = self.original_workspace_root
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     def test_write_new_file_overwrite_mode(self):
@@ -50,8 +55,18 @@ class WriteFileToolTests(unittest.TestCase):
     def test_blocks_outside_cwd(self):
         outside = Path(self.tmpdir).parent / "outside-write-test.txt"
         result = write_file.execute(path=str(outside), content="blocked")
-        self.assertIn("Refusing to write outside current working directory", result)
+        self.assertIn("Refusing to write outside workspace root", result)
         self.assertFalse(outside.exists())
+
+    def test_workspace_root_anchor_allows_subdirs_from_nested_cwd(self):
+        nested = Path(self.tmpdir) / "child"
+        nested.mkdir(parents=True, exist_ok=True)
+        os.environ["SIMPLEAGENT_WORKSPACE_ROOT"] = self.tmpdir
+        os.chdir(nested)
+
+        result = write_file.execute(path="docs/demo.txt", content="ok", create_dirs=True)
+        self.assertIn("SUCCESS:", result)
+        self.assertEqual((Path(self.tmpdir) / "docs" / "demo.txt").read_text(encoding="utf-8"), "ok")
 
 
 if __name__ == "__main__":

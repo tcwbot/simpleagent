@@ -6,7 +6,7 @@ SCHEMA = {
     "function": {
         "name": "write_file",
         "description": (
-            "Write text to a file inside the current working directory only. "
+            "Write text to a file inside the configured workspace root only. "
             "Supports overwrite or append modes with overwrite confirmation."
         ),
         "parameters": {
@@ -43,15 +43,22 @@ SCHEMA = {
 }
 
 
-def _resolve_within_cwd(path: str):
-    cwd = Path(os.getcwd()).resolve()
+def _get_workspace_root() -> Path:
+    # Anchors writes to one root for the whole lm session.
+    configured_root = os.environ.get("SIMPLEAGENT_WORKSPACE_ROOT", "").strip()
+    root = Path(configured_root).expanduser() if configured_root else Path(os.getcwd())
+    return root.resolve()
+
+
+def _resolve_within_workspace(path: str):
+    workspace_root = _get_workspace_root()
     target = Path(path).expanduser()
     if not target.is_absolute():
-        target = cwd / target
+        target = workspace_root / target
     target = target.resolve()
-    if target != cwd and cwd not in target.parents:
-        return None, cwd, target
-    return target, cwd, target
+    if target != workspace_root and workspace_root not in target.parents:
+        return None, workspace_root, target
+    return target, workspace_root, target
 
 
 def execute(
@@ -65,11 +72,11 @@ def execute(
         if mode not in {"overwrite", "append"}:
             return "ERROR: mode must be 'overwrite' or 'append'."
 
-        target, cwd, resolved_target = _resolve_within_cwd(path)
+        target, workspace_root, resolved_target = _resolve_within_workspace(path)
         if target is None:
             return (
-                "ERROR: Refusing to write outside current working directory. "
-                f"cwd={cwd} target={resolved_target}"
+                "ERROR: Refusing to write outside workspace root. "
+                f"workspace_root={workspace_root} target={resolved_target}"
             )
 
         if target.exists() and target.is_dir():

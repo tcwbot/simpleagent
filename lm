@@ -5,7 +5,24 @@ import importlib.util
 import ollama
 import logging
 import json
+import multiprocessing as mp
+import queue
+import time
+import select
+import termios
+import tty
+from contextlib import nullcontext
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
+from swarm_supervisor import ProcessSupervisor, WorkerSpec, emit_event
+
+try:
+    from rich.live import Live
+    from rich.layout import Layout
+    from rich.panel import Panel
+    from rich.table import Table
+    RICH_AVAILABLE = True
+except Exception:
+    RICH_AVAILABLE = False
 
 # Set logging levels to reduce noise
 sys.stderr = open(os.devnull,"w")
@@ -14,6 +31,8 @@ os.environ["CURL_CFFI_LOG_LEVEL"] = "error"
 MODEL_NAME = 'granite4:7b-a1b-h'
 DEFAULT_MAX_STEPS = 12
 DEFAULT_TOOL_TIMEOUT_SEC = 20
+DEFAULT_SWARM_WORKERS = 2
+DEFAULT_SWARM_MAX_REVIEWS = 2
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SKILLS_DIR = os.path.join(BASE_DIR, "skills")
@@ -52,6 +71,1103 @@ def extract_debug_lines(message):
 
     return lines
 
+
+def call_ollama_with_timeout(model_name, messages, timeout_sec):
+    """Run an Ollama chat call with a hard timeout."""
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(ollama.chat, model=model_name, messages=messages)
+        return future.result(timeout=timeout_sec)
+
+
+def emit_worker_error(event_queue, agent_id, role, error_type, details, **extra):
+    """Emit a normalized error event for worker/coordinator observability."""
+    payload = {
+        "agent_id": agent_id,
+        "role": role,
+        "error_type": error_type,
+        "details": short_text(details, max_len=240),
+    }
+    payload.update(extra)
+    emit_event(event_queue, "worker_error", **payload)
+
+
+def parse_json_payload(text):
+    """Parse JSON even if the model adds wrappers, fences, or trailing text."""
+    decoder = json.JSONDecoder()
+    raw = (text or "").strip()
+    if not raw:
+        raise ValueError("empty response")
+
+    candidates = [raw]
+    if raw.startswith("```"):
+        lines = raw.splitlines()
+        if len(lines) >= 3 and lines[-1].strip() == "```":
+            candidates.append("\n".join(lines[1:-1]).strip())
+            if lines[0].strip().lower().startswith("```json"):
+                candidates.append("\n".join(lines[1:-1]).strip())
+
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            return json.loads(candidate)
+        except Exception:  # noqa: BLE001
+            pass
+
+        # Fallback: find first JSON object/array and decode only that.
+        for idx, ch in enumerate(candidate):
+            if ch not in "{[":
+                continue
+            try:
+                parsed, _end = decoder.raw_decode(candidate[idx:])
+                return parsed
+            except Exception:  # noqa: BLE001
+                continue
+
+    raise ValueError("no valid JSON payload found")
+
+
+def normalize_critic_review_payload(parsed):
+    """Validate and normalize critic response schema."""
+    if not isinstance(parsed, dict):
+        return None
+    status = parsed.get("status")
+    if status not in {"pass", "fail"}:
+        return None
+    follow_up_tasks = parsed.get("follow_up_tasks", [])
+    normalized_follow_ups = []
+    if isinstance(follow_up_tasks, list):
+        for item in follow_up_tasks:
+            if isinstance(item, str) and item.strip():
+                normalized_follow_ups.append(item.strip())
+    return {
+        "status": status,
+        "feedback": str(parsed.get("feedback", "")),
+        "summary": str(parsed.get("summary", "")),
+        "follow_up_tasks": normalized_follow_ups[:5],
+        "schema_invalid": False,
+    }
+
+
+def normalize_synth_payload(parsed):
+    """Validate and normalize synthesizer response schema."""
+    if not isinstance(parsed, dict):
+        return None
+    status = parsed.get("status")
+    if status not in {"ok", "error"}:
+        return None
+    return {
+        "status": status,
+        "final_answer": str(parsed.get("final_answer", "")),
+        "details": str(parsed.get("details", "")),
+    }
+
+
+def build_swarm_output_payload(parsed_args, prompt_text, critic_review, synth_result, final_results, error_result):
+    """Build final structured output payload for swarm mode."""
+    output_payload = {
+        "mode": "swarm",
+        "status": "error",
+        "error_type": None,
+        "goal": prompt_text,
+        "critic_review": critic_review,
+        "synth_result": synth_result,
+        "results": final_results,
+        "error": error_result,
+        "fallback_used": False,
+    }
+
+    if error_result:
+        output_payload["status"] = "error"
+        if "timeout" in error_result.lower():
+            output_payload["error_type"] = "timeout"
+        elif "stopped by user" in error_result.lower():
+            output_payload["error_type"] = "user_interrupt"
+        elif "worker error" in error_result.lower():
+            output_payload["error_type"] = "worker_error"
+        else:
+            output_payload["error_type"] = "runtime_error"
+        return output_payload
+
+    if final_results:
+        critic_ok = critic_review and (
+            critic_review.get("status") == "pass" or critic_review.get("schema_invalid")
+        )
+        if critic_ok and synth_result and synth_result.get("status") == "ok":
+            output_payload["status"] = "ok"
+            output_payload["final_answer"] = synth_result.get("final_answer", "")
+        elif critic_ok:
+            output_payload["status"] = "ok"
+            output_payload["fallback_used"] = True
+            output_payload["final_answer"] = "\n\n".join(
+                f"[{item.get('task_id')}] {item.get('output', '').strip()}"
+                for item in sorted(final_results, key=lambda r: r.get("task_id", ""))
+            )
+            output_payload["error"] = (
+                synth_result.get("details", "unknown synthesizer issue") if synth_result else "unknown synthesizer issue"
+            )
+        else:
+            output_payload["status"] = "rejected"
+            feedback = critic_review.get("feedback", "") if critic_review else ""
+            output_payload["error"] = f"Critic rejected final output. {feedback}".strip()
+            output_payload["error_type"] = "critic_rejected"
+        return output_payload
+
+    output_payload["status"] = "timeout"
+    output_payload["error"] = f"Swarm mode stopped after max steps ({parsed_args.max_steps}) without a final result."
+    output_payload["error_type"] = "timeout"
+    return output_payload
+
+
+class SwarmTui:
+    def __init__(self, agent_ids, endpoint_name, model_name):
+        self.endpoint_name = endpoint_name
+        self.model_name = model_name
+        now = time.time()
+        self.processes = {
+            agent_id: {
+                "role": "unknown",
+                "pid": "-",
+                "state": "registered",
+                "restarts": 0,
+                "last_heartbeat": None,
+                "heartbeat_count": 0,
+                "last_seen": now,
+            }
+            for agent_id in agent_ids
+        }
+        self.events = []
+        self.reasoning = {agent_id: [] for agent_id in agent_ids}
+        self.view_mode = "dashboard"
+        self._view_order = ["dashboard", "reasoning", "events", "processes"]
+
+    def _event_line(self, event):
+        event_name = event.get("event", "unknown")
+        agent_id = event.get("agent_id", "n/a")
+        msg = event.get("msg")
+        task_id = event.get("task_id")
+        request_id = event.get("request_id")
+        parts = [event_name, f"agent={agent_id}"]
+        if msg:
+            parts.append(f"msg={msg}")
+        if task_id:
+            parts.append(f"task={task_id}")
+        if request_id:
+            parts.append(f"request={request_id}")
+        return " ".join(parts)
+
+    def _append_reasoning(self, agent_id, text):
+        if not text:
+            return
+        bucket = self.reasoning.setdefault(agent_id, [])
+        bucket.append(short_text(text, max_len=220))
+        self.reasoning[agent_id] = bucket[-6:]
+
+    def handle_key(self, ch):
+        if not ch:
+            return
+        if ch == "\t":
+            idx = self._view_order.index(self.view_mode)
+            self.view_mode = self._view_order[(idx + 1) % len(self._view_order)]
+            return
+        key = ch.lower()
+        if key == "r":
+            self.view_mode = "reasoning"
+        elif key == "e":
+            self.view_mode = "events"
+        elif key == "p":
+            self.view_mode = "processes"
+        elif key == "d":
+            self.view_mode = "dashboard"
+
+    def handle_event(self, event, supervisor):
+        now = time.time()
+        agent_id = event.get("agent_id")
+        if agent_id and agent_id not in self.processes:
+            self.processes[agent_id] = {
+                "role": event.get("role", "unknown"),
+                "pid": "-",
+                "state": "registered",
+                "restarts": 0,
+                "last_heartbeat": None,
+                "heartbeat_count": 0,
+                "last_seen": now,
+            }
+
+        if agent_id:
+            info = self.processes[agent_id]
+            info["role"] = event.get("role", info["role"])
+            info["last_seen"] = now
+
+            if event.get("event") == "heartbeat":
+                info["last_heartbeat"] = now
+                info["heartbeat_count"] += 1
+            elif event.get("event") == "process_started":
+                info["pid"] = event.get("pid", info["pid"])
+                info["state"] = "running"
+            elif event.get("event") in {"process_exiting", "process_shutdown_complete"}:
+                info["state"] = "stopped"
+            elif event.get("event") in {"process_died", "process_killed"}:
+                info["state"] = "failed"
+
+            if event.get("msg") in {"planning_completed", "task_completed", "review_completed", "synthesis_completed"}:
+                summary = event.get("summary") or event.get("details")
+                if summary:
+                    self._append_reasoning(agent_id, summary)
+
+        # Pull restart/state info from supervisor truth.
+        for worker in supervisor.workers.values():
+            pid = worker.pid if worker.pid is not None else "-"
+            proc = self.processes.setdefault(
+                worker.spec.agent_id,
+                {
+                    "role": worker.spec.role,
+                    "pid": "-",
+                    "state": "registered",
+                    "restarts": 0,
+                    "last_heartbeat": None,
+                    "heartbeat_count": 0,
+                    "last_seen": now,
+                },
+            )
+            proc["role"] = worker.spec.role
+            proc["pid"] = pid
+            proc["state"] = worker.state
+            proc["restarts"] = worker.restarts
+
+        if event.get("event") != "heartbeat":
+            self.events.append(self._event_line(event))
+            self.events = self.events[-80:]
+
+    def render(self):
+        now = time.time()
+        header = Panel(
+            f"Endpoint: {self.endpoint_name}    Model: {self.model_name}    View: {self.view_mode}",
+            title="Swarm Runtime",
+            border_style="green",
+        )
+
+        proc_table = Table(title="Processes", expand=True)
+        proc_table.add_column("Agent")
+        proc_table.add_column("Role")
+        proc_table.add_column("PID")
+        proc_table.add_column("State")
+        proc_table.add_column("Restarts")
+        proc_table.add_column("Heartbeat Age")
+        for agent_id in sorted(self.processes.keys()):
+            info = self.processes[agent_id]
+            hb = info.get("last_heartbeat")
+            hb_age = "-" if hb is None else f"{now - hb:.1f}s"
+            proc_table.add_row(
+                agent_id,
+                str(info.get("role", "unknown")),
+                str(info.get("pid", "-")),
+                str(info.get("state", "unknown")),
+                str(info.get("restarts", 0)),
+                hb_age,
+            )
+
+        hb_table = Table(title="Heartbeats", expand=True)
+        hb_table.add_column("Agent")
+        hb_table.add_column("Count")
+        hb_table.add_column("Last Seen")
+        for agent_id in sorted(self.processes.keys()):
+            info = self.processes[agent_id]
+            last_seen = info.get("last_seen", now)
+            hb_table.add_row(
+                agent_id,
+                str(info.get("heartbeat_count", 0)),
+                f"{now - last_seen:.1f}s ago",
+            )
+
+        reasoning_lines = []
+        for agent_id in sorted(self.reasoning.keys()):
+            notes = self.reasoning.get(agent_id, [])
+            if notes:
+                reasoning_lines.append(f"{agent_id}:")
+                for note in notes[-3:]:
+                    reasoning_lines.append(f"  - {note}")
+        reasoning_text = "\n".join(reasoning_lines) if reasoning_lines else "No reasoning summaries yet."
+        reasoning_panel = Panel(reasoning_text, title="Reasoning", border_style="magenta")
+
+        events_text = "\n".join(self.events[-20:]) if self.events else "No events yet."
+        events_panel = Panel(events_text, title="Recent Events", border_style="cyan")
+        shortcuts = Panel(
+            "[Tab] cycle view   [d] dashboard   [r] reasoning   [e] events   [p] processes   [q] quit",
+            border_style="yellow",
+            title="Shortcuts",
+        )
+
+        layout = Layout()
+        layout.split_column(
+            Layout(header, name="header", size=3),
+            Layout(name="body"),
+            Layout(shortcuts, name="shortcuts", size=3),
+        )
+
+        body = layout["body"]
+        if self.view_mode == "reasoning":
+            body.update(reasoning_panel)
+        elif self.view_mode == "events":
+            body.update(events_panel)
+        elif self.view_mode == "processes":
+            body.split_row(
+                Layout(proc_table, name="proc", ratio=2),
+                Layout(hb_table, name="hb", ratio=1),
+            )
+        else:
+            body.split_row(
+                Layout(name="left", ratio=1),
+                Layout(name="right", ratio=1),
+            )
+            body["left"].split_column(
+                Layout(proc_table, name="proc"),
+                Layout(hb_table, name="hb"),
+            )
+            body["right"].split_column(
+                Layout(reasoning_panel, name="reason"),
+                Layout(events_panel, name="events"),
+            )
+        return layout
+
+
+class KeyboardController:
+    def __init__(self, enabled):
+        self.enabled = enabled and sys.stdin.isatty()
+        self.fd = None
+        self.old_settings = None
+
+    def __enter__(self):
+        if not self.enabled:
+            return self
+        self.fd = sys.stdin.fileno()
+        self.old_settings = termios.tcgetattr(self.fd)
+        tty.setcbreak(self.fd)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self.enabled and self.fd is not None and self.old_settings is not None:
+            termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old_settings)
+
+    def read_key(self):
+        if not self.enabled or self.fd is None:
+            return None
+        rlist, _, _ = select.select([sys.stdin], [], [], 0)
+        if not rlist:
+            return None
+        try:
+            return os.read(self.fd, 1).decode("utf-8", errors="ignore")
+        except Exception:
+            return None
+
+
+def swarm_planner_worker(
+    stop_event,
+    event_queue,
+    task_queue,
+    plan_queue,
+    goal,
+    model_name,
+    model_timeout_sec,
+):
+    emit_event(event_queue, "worker_progress", agent_id="planner-1", role="planner", msg="planning_started")
+    tasks = []
+    try:
+        response = call_ollama_with_timeout(
+            model_name,
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a planning agent. Break the user goal into 1-5 concrete tasks. "
+                        "Return only valid JSON array of strings."
+                    ),
+                },
+                {"role": "user", "content": goal},
+            ],
+            model_timeout_sec,
+        )
+        content = (response.message.content or "").strip()
+        parsed = parse_json_payload(content)
+        if isinstance(parsed, list):
+            for item in parsed:
+                if isinstance(item, str) and item.strip():
+                    tasks.append(item.strip())
+    except TimeoutError:
+        emit_worker_error(
+            event_queue,
+            agent_id="planner-1",
+            role="planner",
+            error_type="model_timeout",
+            details=f"planner model call exceeded {model_timeout_sec}s",
+            msg="planning_timeout",
+        )
+    except Exception as err:  # noqa: BLE001
+        emit_worker_error(
+            event_queue,
+            agent_id="planner-1",
+            role="planner",
+            error_type="planner_error",
+            details=str(err),
+            msg="planning_fallback",
+        )
+
+    if not tasks:
+        tasks = [goal]
+
+    task_count = min(len(tasks), 5)
+    for i in range(task_count):
+        task = {
+            "task_id": f"task-{i + 1}",
+            "instruction": tasks[i],
+            "created_by": "planner-1",
+        }
+        task_queue.put(task)
+
+    plan_queue.put({"status": "planned", "task_count": task_count})
+    emit_event(
+        event_queue,
+        "worker_progress",
+        agent_id="planner-1",
+        role="planner",
+        msg="planning_completed",
+        task_count=task_count,
+        summary=f"Planned {task_count} task(s): {', '.join(tasks[:3])}",
+    )
+
+    # Keep process alive so heartbeat tracking remains visible until shutdown.
+    while not stop_event.is_set():
+        time.sleep(0.2)
+
+
+def swarm_worker_worker(
+    stop_event,
+    event_queue,
+    task_queue,
+    result_queue,
+    model_name,
+    agent_id,
+    model_timeout_sec,
+):
+    while not stop_event.is_set():
+        try:
+            task = task_queue.get(timeout=0.3)
+        except queue.Empty:
+            continue
+
+        task_id = task.get("task_id", "task-unknown")
+        instruction = task.get("instruction", "")
+        emit_event(
+            event_queue,
+            "worker_progress",
+            agent_id=agent_id,
+            role="worker",
+            task_id=task_id,
+            msg="task_started",
+        )
+        try:
+            response = call_ollama_with_timeout(
+                model_name,
+                [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a worker agent in a swarm. Solve the assigned task directly and succinctly."
+                        ),
+                    },
+                    {"role": "user", "content": instruction},
+                ],
+                model_timeout_sec,
+            )
+            output = (response.message.content or "").strip()
+            result_queue.put(
+                {
+                    "task_id": task_id,
+                    "status": "done",
+                    "output": output,
+                    "agent_id": agent_id,
+                }
+            )
+            emit_event(
+                event_queue,
+                "worker_progress",
+                agent_id=agent_id,
+                role="worker",
+                task_id=task_id,
+                msg="task_completed",
+                summary=short_text(output, max_len=180),
+            )
+        except TimeoutError:
+            error_payload = {
+                "task_id": task_id,
+                "status": "error",
+                "output": f"worker model call exceeded {model_timeout_sec}s",
+                "agent_id": agent_id,
+            }
+            result_queue.put(error_payload)
+            emit_worker_error(
+                event_queue,
+                agent_id=agent_id,
+                role="worker",
+                error_type="model_timeout",
+                details=f"worker model call exceeded {model_timeout_sec}s",
+                task_id=task_id,
+                msg="task_timeout",
+            )
+        except Exception as err:  # noqa: BLE001
+            error_payload = {
+                "task_id": task_id,
+                "status": "error",
+                "output": str(err),
+                "agent_id": agent_id,
+            }
+            result_queue.put(error_payload)
+            emit_worker_error(
+                event_queue,
+                agent_id=agent_id,
+                role="worker",
+                error_type="worker_error",
+                details=str(err),
+                task_id=task_id,
+                msg="task_failed",
+            )
+
+
+def swarm_critic_worker(
+    stop_event,
+    event_queue,
+    critique_request_queue,
+    critique_result_queue,
+    model_name,
+    model_timeout_sec,
+):
+    while not stop_event.is_set():
+        try:
+            request = critique_request_queue.get(timeout=0.3)
+        except queue.Empty:
+            continue
+
+        request_id = request.get("request_id", "review-unknown")
+        goal = request.get("goal", "")
+        results = request.get("results", [])
+
+        emit_event(
+            event_queue,
+            "worker_progress",
+            agent_id="critic-1",
+            role="critic",
+            request_id=request_id,
+            msg="review_started",
+        )
+
+        review_payload = {
+            "status": "fail",
+            "feedback": "No review generated.",
+            "summary": "",
+            "follow_up_tasks": [],
+            "schema_invalid": False,
+        }
+        try:
+            response = call_ollama_with_timeout(
+                model_name,
+                [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a critic in an agent swarm. Evaluate if worker outputs satisfy the goal. "
+                            "Return only JSON object with keys: status (pass|fail), feedback, summary, follow_up_tasks. "
+                            "follow_up_tasks must be an array of concrete task strings when status=fail, otherwise []."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Goal:\n{goal}\n\n"
+                            f"Worker outputs:\n{json.dumps(results, ensure_ascii=True)}"
+                        ),
+                    },
+                ],
+                model_timeout_sec,
+            )
+            content = (response.message.content or "").strip()
+            parsed = parse_json_payload(content)
+            normalized = normalize_critic_review_payload(parsed)
+            if normalized:
+                review_payload = normalized
+            else:
+                retry_response = call_ollama_with_timeout(
+                    model_name,
+                    [
+                        {
+                            "role": "system",
+                            "content": (
+                                "Return only valid JSON object. No prose. "
+                                "Schema: status(pass|fail), feedback(string), summary(string), follow_up_tasks(array of strings)."
+                            ),
+                        },
+                        {
+                            "role": "user",
+                            "content": (
+                                f"Goal:\n{goal}\n\n"
+                                f"Worker outputs:\n{json.dumps(results, ensure_ascii=True)}"
+                            ),
+                        },
+                    ],
+                    model_timeout_sec,
+                )
+                retry_content = (retry_response.message.content or "").strip()
+                retry_parsed = parse_json_payload(retry_content)
+                normalized_retry = normalize_critic_review_payload(retry_parsed)
+                if normalized_retry:
+                    review_payload = normalized_retry
+                else:
+                    review_payload["feedback"] = "Critic returned invalid schema."
+                    review_payload["schema_invalid"] = True
+        except TimeoutError:
+            review_payload["feedback"] = f"Critic timeout: model call exceeded {model_timeout_sec}s"
+            emit_worker_error(
+                event_queue,
+                agent_id="critic-1",
+                role="critic",
+                error_type="model_timeout",
+                details=review_payload["feedback"],
+                request_id=request_id,
+            )
+        except Exception as err:  # noqa: BLE001
+            review_payload["feedback"] = f"Critic error: {err}"
+            emit_worker_error(
+                event_queue,
+                agent_id="critic-1",
+                role="critic",
+                error_type="critic_error",
+                details=review_payload["feedback"],
+                request_id=request_id,
+            )
+
+        review_payload["request_id"] = request_id
+        critique_result_queue.put(review_payload)
+        emit_event(
+            event_queue,
+            "worker_progress",
+            agent_id="critic-1",
+            role="critic",
+            request_id=request_id,
+            msg="review_completed",
+            status=review_payload.get("status"),
+            summary=short_text(
+                f"status={review_payload.get('status')} feedback={review_payload.get('feedback', '')}",
+                max_len=180,
+            ),
+        )
+
+
+def swarm_synthesizer_worker(
+    stop_event,
+    event_queue,
+    synth_request_queue,
+    synth_result_queue,
+    model_name,
+    model_timeout_sec,
+):
+    while not stop_event.is_set():
+        try:
+            request = synth_request_queue.get(timeout=0.3)
+        except queue.Empty:
+            continue
+
+        request_id = request.get("request_id", "synth-unknown")
+        goal = request.get("goal", "")
+        results = request.get("results", [])
+        critic_summary = request.get("critic_summary", "")
+
+        emit_event(
+            event_queue,
+            "worker_progress",
+            agent_id="synthesizer-1",
+            role="synthesizer",
+            request_id=request_id,
+            msg="synthesis_started",
+        )
+
+        payload = {"status": "error", "final_answer": "", "details": "No synthesis generated."}
+        try:
+            response = call_ollama_with_timeout(
+                model_name,
+                [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a synthesizer in an agent swarm. Create one cohesive final answer from approved "
+                            "worker outputs. Return only JSON object with keys: status (ok|error), final_answer, details."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Goal:\n{goal}\n\n"
+                            f"Critic summary:\n{critic_summary}\n\n"
+                            f"Approved worker outputs:\n{json.dumps(results, ensure_ascii=True)}"
+                        ),
+                    },
+                ],
+                model_timeout_sec,
+            )
+            content = (response.message.content or "").strip()
+            parsed = parse_json_payload(content)
+            normalized = normalize_synth_payload(parsed)
+            if normalized:
+                payload = normalized
+            else:
+                payload["details"] = "Synthesizer returned invalid schema."
+        except TimeoutError:
+            payload["details"] = f"Synthesizer timeout: model call exceeded {model_timeout_sec}s"
+            emit_worker_error(
+                event_queue,
+                agent_id="synthesizer-1",
+                role="synthesizer",
+                error_type="model_timeout",
+                details=payload["details"],
+                request_id=request_id,
+            )
+        except Exception as err:  # noqa: BLE001
+            payload["details"] = f"Synthesizer error: {err}"
+            emit_worker_error(
+                event_queue,
+                agent_id="synthesizer-1",
+                role="synthesizer",
+                error_type="synthesizer_error",
+                details=payload["details"],
+                request_id=request_id,
+            )
+
+        payload["request_id"] = request_id
+        synth_result_queue.put(payload)
+        emit_event(
+            event_queue,
+            "worker_progress",
+            agent_id="synthesizer-1",
+            role="synthesizer",
+            request_id=request_id,
+            msg="synthesis_completed",
+            status=payload.get("status"),
+            summary=short_text(
+                payload.get("details") or payload.get("final_answer", ""),
+                max_len=180,
+            ),
+        )
+
+
+def run_swarm_mode(parsed_args, prompt_text):
+    task_queue = mp.Queue()
+    result_queue = mp.Queue()
+    plan_queue = mp.Queue()
+    critique_request_queue = mp.Queue()
+    critique_result_queue = mp.Queue()
+    synth_request_queue = mp.Queue()
+    synth_result_queue = mp.Queue()
+    supervisor = ProcessSupervisor(
+        heartbeat_timeout_sec=max(parsed_args.tool_timeout, 5),
+        shutdown_timeout_sec=5,
+        event_log_path=os.path.join(BASE_DIR, "docs", "process-events.jsonl"),
+    )
+    supervisor.register(
+        WorkerSpec(
+            agent_id="planner-1",
+            role="planner",
+            target=swarm_planner_worker,
+            args=(task_queue, plan_queue, prompt_text, parsed_args.model, parsed_args.tool_timeout),
+            max_restarts=1,
+            heartbeat_sec=2,
+        )
+    )
+    for i in range(parsed_args.swarm_workers):
+        worker_id = f"worker-{i + 1}"
+        supervisor.register(
+            WorkerSpec(
+                agent_id=worker_id,
+                role="worker",
+                target=swarm_worker_worker,
+                args=(task_queue, result_queue, parsed_args.model, worker_id, parsed_args.tool_timeout),
+                max_restarts=1,
+                heartbeat_sec=2,
+            )
+        )
+    supervisor.register(
+        WorkerSpec(
+            agent_id="critic-1",
+            role="critic",
+            target=swarm_critic_worker,
+            args=(critique_request_queue, critique_result_queue, parsed_args.model, parsed_args.tool_timeout),
+            max_restarts=1,
+            heartbeat_sec=2,
+        )
+    )
+    supervisor.register(
+        WorkerSpec(
+            agent_id="synthesizer-1",
+            role="synthesizer",
+            target=swarm_synthesizer_worker,
+            args=(synth_request_queue, synth_result_queue, parsed_args.model, parsed_args.tool_timeout),
+            max_restarts=1,
+            heartbeat_sec=2,
+        )
+    )
+
+    use_text_debug = parsed_args.debug and not parsed_args.tui
+    use_tui = parsed_args.tui
+    tui = SwarmTui(list(supervisor.workers.keys()), parsed_args.endpoint, parsed_args.model) if use_tui else None
+
+    if use_text_debug:
+        print("SWARM MODE")
+        print(f"  endpoint: {parsed_args.endpoint}")
+        print(f"  model: {parsed_args.model}")
+        print(f"  agents: planner-1, workers={parsed_args.swarm_workers}, critic-1, synthesizer-1")
+        print(f"  max_steps: {parsed_args.max_steps}")
+
+    supervisor.start_all()
+    live_context = Live(tui.render(), refresh_per_second=4, transient=False) if use_tui else nullcontext()
+    final_results = []
+    error_result = None
+    critic_review = None
+    synth_result = None
+    ui_state = {"user_quit": False, "kb": None, "live": None}
+
+    def drain_lifecycle():
+        events = supervisor.drain_events()
+        supervisor.check_workers()
+        for event in events:
+            if use_tui:
+                tui.handle_event(event, supervisor)
+        if use_tui:
+            live.update(tui.render())
+            if ui_state["kb"] is not None:
+                key = ui_state["kb"].read_key()
+                if key:
+                    if key.lower() == "q":
+                        ui_state["user_quit"] = True
+                    else:
+                        tui.handle_key(key)
+                        live.update(tui.render())
+        if use_text_debug:
+            for event in events:
+                event_name = event.get("event", "unknown")
+                agent_id = event.get("agent_id", "n/a")
+                suffix = ""
+                if "task_id" in event:
+                    suffix += f" task={event.get('task_id')}"
+                if "request_id" in event:
+                    suffix += f" request={event.get('request_id')}"
+                if "msg" in event:
+                    suffix += f" msg={event.get('msg')}"
+                print(f"  lifecycle: {event_name} agent={agent_id}{suffix}")
+
+    def wait_for_planner_count():
+        deadline = time.time() + max(parsed_args.tool_timeout, 2)
+        while time.time() < deadline:
+            drain_lifecycle()
+            try:
+                plan_info = plan_queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            if plan_info.get("status") == "planned":
+                count = int(plan_info.get("task_count", 0))
+                if use_text_debug:
+                    print(f"  planner: generated_tasks={count}")
+                return count
+        return None
+
+    def collect_task_results(expected_count, label):
+        if expected_count <= 0:
+            return []
+        batch_results = []
+        seen_task_ids = set()
+        deadline = time.time() + max(parsed_args.tool_timeout, 2) * max(expected_count, 1)
+        while len(batch_results) < expected_count and time.time() < deadline:
+            drain_lifecycle()
+            try:
+                result = result_queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+
+            task_id = result.get("task_id")
+            if task_id in seen_task_ids:
+                continue
+            seen_task_ids.add(task_id)
+            if use_text_debug:
+                print(
+                    f"  result: batch={label} task={task_id} status={result.get('status')} "
+                    f"agent={result.get('agent_id')}"
+                )
+            if result.get("status") != "done":
+                return None, f"Worker error on {task_id}: {result.get('output', 'unknown error')}"
+            batch_results.append(result)
+            final_results.append(result)
+
+        if len(batch_results) < expected_count:
+            return None, f"Timed out waiting for task results in batch '{label}'."
+        return batch_results, None
+
+    def request_critic_review(review_id):
+        critique_request_queue.put(
+            {
+                "request_id": review_id,
+                "goal": prompt_text,
+                "results": final_results,
+            }
+        )
+        deadline = time.time() + max(parsed_args.tool_timeout, 2)
+        while time.time() < deadline:
+            drain_lifecycle()
+            try:
+                return critique_result_queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+        return None
+
+    def request_synthesis():
+        synth_request_queue.put(
+            {
+                "request_id": "synth-1",
+                "goal": prompt_text,
+                "results": final_results,
+                "critic_summary": critic_review.get("summary", "") if critic_review else "",
+            }
+        )
+        deadline = time.time() + max(parsed_args.tool_timeout, 2)
+        while time.time() < deadline:
+            drain_lifecycle()
+            try:
+                return synth_result_queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+        return None
+
+    with live_context as live, KeyboardController(use_tui) as kb:
+        try:
+            ui_state["kb"] = kb
+            ui_state["live"] = live
+
+            planned_count = wait_for_planner_count()
+            if ui_state["user_quit"]:
+                error_result = "Swarm stopped by user (q)."
+            if planned_count is None:
+                error_result = "Planner did not return a task plan before timeout."
+            else:
+                _, batch_error = collect_task_results(planned_count, "initial")
+                if batch_error:
+                    error_result = batch_error
+
+            review_round = 1
+            task_seq = planned_count or 0
+            while error_result is None and final_results and review_round <= parsed_args.swarm_max_reviews:
+                if ui_state["user_quit"]:
+                    error_result = "Swarm stopped by user (q)."
+                    break
+                critic_review = request_critic_review(f"review-{review_round}")
+                if not critic_review:
+                    error_result = "Critic did not return a review before timeout."
+                    break
+
+                if use_text_debug:
+                    status = critic_review.get("status", "unknown")
+                    print(f"  critic: round={review_round} status={status}")
+
+                if critic_review.get("status") == "pass":
+                    break
+
+                follow_ups = critic_review.get("follow_up_tasks", [])
+                if not isinstance(follow_ups, list):
+                    follow_ups = []
+                follow_ups = [task for task in follow_ups if isinstance(task, str) and task.strip()]
+
+                if critic_review.get("schema_invalid"):
+                    if use_text_debug:
+                        print("  critic: schema invalid, continuing with synthesis fallback path")
+                    break
+
+                if not follow_ups:
+                    break
+                if review_round >= parsed_args.swarm_max_reviews:
+                    break
+
+                if use_text_debug:
+                    print(f"  critic: enqueue_followups={len(follow_ups)}")
+                for task_text in follow_ups:
+                    if ui_state["user_quit"]:
+                        error_result = "Swarm stopped by user (q)."
+                        break
+                    task_seq += 1
+                    task_queue.put(
+                        {
+                            "task_id": f"task-{task_seq}",
+                            "instruction": task_text.strip(),
+                            "created_by": "critic-1",
+                        }
+                    )
+                if ui_state["user_quit"]:
+                    break
+
+                _, batch_error = collect_task_results(len(follow_ups), f"retry-{review_round}")
+                if batch_error:
+                    error_result = batch_error
+                    break
+                review_round += 1
+
+            critic_ok = critic_review and (
+                critic_review.get("status") == "pass" or critic_review.get("schema_invalid")
+            )
+            if error_result is None and critic_ok:
+                if ui_state["user_quit"]:
+                    error_result = "Swarm stopped by user (q)."
+                else:
+                    synth_result = request_synthesis()
+                    if not synth_result:
+                        synth_result = {
+                            "status": "error",
+                            "final_answer": "",
+                            "details": "Synthesizer did not return a result before timeout.",
+                        }
+        finally:
+            supervisor.shutdown()
+            final_events = supervisor.drain_events()
+            if use_tui:
+                for event in final_events:
+                    tui.handle_event(event, supervisor)
+                live.update(tui.render())
+            if use_text_debug:
+                for event in final_events:
+                    print(f"  lifecycle: {event.get('event', 'unknown')} agent={event.get('agent_id', 'n/a')}")
+
+    output_payload = build_swarm_output_payload(
+        parsed_args=parsed_args,
+        prompt_text=prompt_text,
+        critic_review=critic_review,
+        synth_result=synth_result,
+        final_results=final_results,
+        error_result=error_result,
+    )
+
+    if parsed_args.output_format == "json":
+        print(json.dumps(output_payload, ensure_ascii=True, indent=2))
+        return
+
+    if output_payload["status"] == "error":
+        print(output_payload.get("error", "Unknown swarm error"))
+    elif output_payload["status"] == "timeout":
+        print(output_payload.get("error", "Swarm timeout"))
+    elif output_payload["status"] == "rejected":
+        print(output_payload.get("error", "Critic rejected output"))
+    else:
+        print(output_payload.get("final_answer", ""))
+        if output_payload.get("fallback_used") and use_text_debug:
+            print(f"\n[SYNTH FALLBACK] {output_payload.get('error', '')}")
+        elif use_text_debug and critic_review and critic_review.get("status") == "pass":
+            print(f"\n[CRITIC] pass: {critic_review.get('feedback', '')}")
+            if critic_review.get("summary"):
+                print(f"[CRITIC SUMMARY] {critic_review.get('summary')}")
+            if synth_result and synth_result.get("details"):
+                print(f"[SYNTH DETAILS] {synth_result.get('details')}")
+
 def load_tools():
     """Loads schemas and functions from the tools/ directory."""
     tool_schemas = []
@@ -84,6 +1200,13 @@ Usage examples:
 ''',
         formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--debug', '-d', action='store_true', help='Show debug output (reasoning and tool calls)')
+    parser.add_argument('--swarm', action='store_true', help='Run planner/worker swarm mode')
+    parser.add_argument('--tui', action='store_true', help='Show swarm dashboard UI (processes, heartbeats, events)')
+    parser.add_argument('--swarm-workers', type=int, default=DEFAULT_SWARM_WORKERS, help='Number of swarm worker processes')
+    parser.add_argument('--swarm-max-reviews', type=int, default=DEFAULT_SWARM_MAX_REVIEWS, help='Maximum critic review rounds')
+    parser.add_argument('--output-format', choices=['markdown', 'json'], default='markdown', help='Final output format')
+    parser.add_argument('--endpoint', default='ollama', help='Model endpoint backend (currently: ollama)')
+    parser.add_argument('--model', default=MODEL_NAME, help='Model name to use for inference')
     parser.add_argument('--max-steps', type=int, default=DEFAULT_MAX_STEPS, help='Maximum agent loop iterations')
     parser.add_argument('--tool-timeout', type=int, default=DEFAULT_TOOL_TIMEOUT_SEC, help='Per-tool timeout in seconds')
     parser.add_argument('prompt', nargs='*', help='Prompt to send to the model')
@@ -118,6 +1241,26 @@ Usage examples:
         print("Error: No input provided. Please provide a prompt or pipe content to the script.")
         return
 
+    if parsed_args.endpoint != "ollama":
+        print(f"Error: endpoint '{parsed_args.endpoint}' is not supported yet. Currently supported: ollama")
+        return
+
+    if parsed_args.swarm:
+        if parsed_args.tui and not RICH_AVAILABLE:
+            print("Error: --tui requires the 'rich' package. Install it with: pip install rich")
+            return
+        if parsed_args.swarm_workers < 1:
+            print("Error: --swarm-workers must be >= 1")
+            return
+        if parsed_args.swarm_max_reviews < 1:
+            print("Error: --swarm-max-reviews must be >= 1")
+            return
+        run_swarm_mode(parsed_args, user_input)
+        return
+    if parsed_args.tui:
+        print("Error: --tui can only be used with --swarm")
+        return
+
     messages = [
         {'role': 'system', 'content': system_prompt},
         {'role': 'user', 'content': user_input}
@@ -130,7 +1273,7 @@ Usage examples:
             step += 1
             # Call Ollama with the current message history and tool definitions
             response = ollama.chat(
-                model=MODEL_NAME, 
+                model=parsed_args.model, 
                 messages=messages, 
                 tools=tool_schemas
             )

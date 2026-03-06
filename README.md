@@ -11,7 +11,7 @@ Create a virtual environment and install the required dependencies for browsing 
 ```bash
 python3 -m venv venv
 source venv/bin/activate
-pip install ollama duckduckgo-search beautifulsoup4
+pip install -r requirements.txt
 
 ```
 
@@ -30,7 +30,7 @@ alias lm='/Users/USERNAME/scripts/llms/simple/venv/bin/python3 /Users/USERNAME/s
 
 ### **Skills (`/skills`)**
 
-Drop `.md` files here to define the agent's "personality" or specific rules (e.g., coding standards, commit message formats). These are injected into the **System Prompt**.
+Skill markdown files are repository artifacts/documentation right now. They are not automatically injected into runtime prompts by `lm`.
 
 ### **Tools (`/tools`)**
 
@@ -73,3 +73,6 @@ lm "What are the latest benchmarks for the Granite 4 model?"
 
 Add new capabilities by creating a new Python script in the `tools/` directory with a defined `SCHEMA` and `execute()` function.
 
+## 📄 License
+
+This project is licensed under the MIT License. See [LICENSE](./LICENSE).

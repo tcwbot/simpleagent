@@ -38,6 +38,26 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SKILLS_DIR = os.path.join(BASE_DIR, "skills")
 TOOLS_DIR = os.path.join(BASE_DIR, "tools")
 
+WORKER_PROMPT_PROFILES = {
+    "general": "You are a worker agent in a swarm. Solve the assigned task directly and succinctly.",
+    "reliability": (
+        "You are a reliability-focused worker agent. Prioritize failure modes, resilience, recovery paths, "
+        "and actionable remediation with clear prioritization."
+    ),
+    "testing": (
+        "You are a testing-focused worker agent. Produce concrete test plans/cases, edge conditions, "
+        "and validation strategy with implementation-ready detail."
+    ),
+    "security": (
+        "You are a security-focused worker agent. Identify realistic security risks, attack surfaces, "
+        "and practical mitigations with priority."
+    ),
+    "docs": (
+        "You are a documentation-focused worker agent. Produce precise, implementation-aligned docs updates "
+        "and concrete wording changes."
+    ),
+}
+
 
 def short_text(value, max_len=240):
     text = str(value).strip()
@@ -241,6 +261,63 @@ def build_swarm_output_payload(parsed_args, prompt_text, critic_review, synth_re
     output_payload["error"] = f"Swarm mode stopped after max steps ({parsed_args.max_steps}) without a final result."
     output_payload["error_type"] = "timeout"
     return output_payload
+
+
+def normalize_planned_tasks(parsed, goal):
+    """Normalize planner output into task objects with optional role/profile hints."""
+    allowed_hints = set(WORKER_PROMPT_PROFILES.keys())
+    tasks = []
+    if isinstance(parsed, list):
+        for item in parsed:
+            if isinstance(item, str) and item.strip():
+                tasks.append(
+                    {
+                        "instruction": item.strip(),
+                        "role_hint": "general",
+                        "prompt_template_id": "general",
+                    }
+                )
+                continue
+            if isinstance(item, dict):
+                instruction = str(item.get("instruction", "")).strip()
+                if not instruction:
+                    continue
+                role_hint = str(item.get("role_hint", "general")).strip().lower() or "general"
+                prompt_template_id = str(item.get("prompt_template_id", role_hint)).strip().lower() or "general"
+                if role_hint not in allowed_hints:
+                    role_hint = "general"
+                if prompt_template_id not in allowed_hints:
+                    prompt_template_id = role_hint if role_hint in allowed_hints else "general"
+                tasks.append(
+                    {
+                        "instruction": instruction,
+                        "role_hint": role_hint,
+                        "prompt_template_id": prompt_template_id,
+                    }
+                )
+    if not tasks:
+        tasks = [
+            {
+                "instruction": goal,
+                "role_hint": "general",
+                "prompt_template_id": "general",
+            }
+        ]
+    return tasks[:5]
+
+
+def derive_role_hint_from_text(text):
+    """Simple heuristic for follow-up tasks that lack explicit role hint."""
+    t = (text or "").lower()
+    if any(k in t for k in ("test", "coverage", "integration", "unit", "assert")):
+        return "testing"
+    if any(k in t for k in ("security", "vuln", "threat", "auth", "secret")):
+        return "security"
+    if any(k in t for k in ("doc", "readme", "documentation", "guide")):
+        return "docs"
+    if any(k in t for k in ("reliability", "failure", "resilien", "timeout", "recovery")):
+        return "reliability"
+    return "general"
 
 
 class SwarmTui:
@@ -531,7 +608,10 @@ def swarm_planner_worker(
                     "role": "system",
                     "content": (
                         "You are a planning agent. Break the user goal into 1-5 concrete tasks. "
-                        "Return only valid JSON array of strings."
+                        "Return only valid JSON array. Preferred item schema: "
+                        "{\"instruction\": string, \"role_hint\": one of [general,reliability,testing,security,docs], "
+                        "\"prompt_template_id\": one of [general,reliability,testing,security,docs]}. "
+                        "String items are also accepted as fallback."
                     ),
                 },
                 {"role": "user", "content": goal},
@@ -541,10 +621,8 @@ def swarm_planner_worker(
         planner_tokens = extract_token_usage(response)
         content = (response.message.content or "").strip()
         parsed = parse_json_payload(content)
-        if isinstance(parsed, list):
-            for item in parsed:
-                if isinstance(item, str) and item.strip():
-                    tasks.append(item.strip())
+        normalized_tasks = normalize_planned_tasks(parsed, goal)
+        tasks = normalized_tasks
     except TimeoutError:
         emit_worker_error(
             event_queue,
@@ -565,13 +643,15 @@ def swarm_planner_worker(
         )
 
     if not tasks:
-        tasks = [goal]
+        tasks = normalize_planned_tasks([], goal)
 
     task_count = min(len(tasks), 5)
     for i in range(task_count):
         task = {
             "task_id": f"task-{i + 1}",
-            "instruction": tasks[i],
+            "instruction": tasks[i]["instruction"],
+            "role_hint": tasks[i].get("role_hint", "general"),
+            "prompt_template_id": tasks[i].get("prompt_template_id", "general"),
             "created_by": "planner-1",
         }
         task_queue.put(task)
@@ -584,7 +664,14 @@ def swarm_planner_worker(
         role="planner",
         msg="planning_completed",
         task_count=task_count,
-        summary=f"Planned {task_count} task(s): {', '.join(tasks[:3])}",
+        summary=(
+            "Planned "
+            f"{task_count} task(s): "
+            + ", ".join(
+                f"{task['instruction'][:40]} ({task.get('role_hint', 'general')})"
+                for task in tasks[:3]
+            )
+        ),
         prompt_tokens=planner_tokens["prompt_tokens"],
         completion_tokens=planner_tokens["completion_tokens"],
         total_tokens=planner_tokens["total_tokens"],
@@ -612,6 +699,9 @@ def swarm_worker_worker(
 
         task_id = task.get("task_id", "task-unknown")
         instruction = task.get("instruction", "")
+        prompt_template_id = str(task.get("prompt_template_id", task.get("role_hint", "general"))).strip().lower()
+        if prompt_template_id not in WORKER_PROMPT_PROFILES:
+            prompt_template_id = "general"
         emit_event(
             event_queue,
             "worker_progress",
@@ -619,6 +709,7 @@ def swarm_worker_worker(
             role="worker",
             task_id=task_id,
             msg="task_started",
+            prompt_template_id=prompt_template_id,
         )
         try:
             response = call_ollama_with_timeout(
@@ -626,9 +717,7 @@ def swarm_worker_worker(
                 [
                     {
                         "role": "system",
-                        "content": (
-                            "You are a worker agent in a swarm. Solve the assigned task directly and succinctly."
-                        ),
+                        "content": WORKER_PROMPT_PROFILES[prompt_template_id],
                     },
                     {"role": "user", "content": instruction},
                 ],
@@ -642,6 +731,7 @@ def swarm_worker_worker(
                     "status": "done",
                     "output": output,
                     "agent_id": agent_id,
+                    "prompt_template_id": prompt_template_id,
                 }
             )
             emit_event(
@@ -652,6 +742,7 @@ def swarm_worker_worker(
                 task_id=task_id,
                 msg="task_completed",
                 summary=short_text(output, max_len=180),
+                prompt_template_id=prompt_template_id,
                 prompt_tokens=worker_tokens["prompt_tokens"],
                 completion_tokens=worker_tokens["completion_tokens"],
                 total_tokens=worker_tokens["total_tokens"],
@@ -662,6 +753,7 @@ def swarm_worker_worker(
                 "status": "error",
                 "output": f"worker model call exceeded {model_timeout_sec}s",
                 "agent_id": agent_id,
+                "prompt_template_id": prompt_template_id,
             }
             result_queue.put(error_payload)
             emit_worker_error(
@@ -679,6 +771,7 @@ def swarm_worker_worker(
                 "status": "error",
                 "output": str(err),
                 "agent_id": agent_id,
+                "prompt_template_id": prompt_template_id,
             }
             result_queue.put(error_payload)
             emit_worker_error(
@@ -1172,11 +1265,14 @@ def run_swarm_mode(parsed_args, prompt_text):
                     if ui_state["user_quit"]:
                         error_result = "Swarm stopped by user (q)."
                         break
+                    role_hint = derive_role_hint_from_text(task_text)
                     task_seq += 1
                     task_queue.put(
                         {
                             "task_id": f"task-{task_seq}",
                             "instruction": task_text.strip(),
+                            "role_hint": role_hint,
+                            "prompt_template_id": role_hint,
                             "created_by": "critic-1",
                         }
                     )

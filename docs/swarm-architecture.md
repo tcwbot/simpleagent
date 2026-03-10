@@ -8,6 +8,17 @@ This project should start with a process-based swarm and a single coordinator.
 - `critic`: check evidence and identify gaps.
 - `synthesizer`: produce final response when checks pass.
 
+## Prompting Principles For Accuracy
+- Keep role prompts specialized and non-overlapping:
+  planner decomposes, worker verifies, critic judges support, synthesizer merges approved outputs.
+- Preserve `Please explain yourself` only as reasoning guidance, not output guidance:
+  `Please explain yourself in your reasoning process, but do not include that reasoning in the final output.`
+- Require workers to ground important claims in file reads, command output, test results, or explicit user input.
+- Require workers to label unknowns instead of guessing.
+- Require critics to fail outputs that are plausible but unsupported.
+- Require synthesizers to avoid adding facts not present in approved worker outputs.
+- Prefer short, schema-safe instructions for planner/critic/synthesizer whenever the final payload must be valid JSON.
+
 ## Shared State (Blackboard)
 Use one state object persisted by the coordinator:
 - `goal`

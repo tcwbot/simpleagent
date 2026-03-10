@@ -1,4 +1,5 @@
 import argparse
+import atexit
 import sys
 import os
 import importlib.util
@@ -11,6 +12,8 @@ import time
 import select
 import termios
 import tty
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from contextlib import nullcontext
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from swarm_supervisor import ProcessSupervisor, WorkerSpec, emit_event
@@ -24,13 +27,17 @@ try:
 except Exception:
     RICH_AVAILABLE = False
 
-# Set logging levels to reduce noise
-sys.stderr = open(os.devnull,"w")
+# Set logging levels to reduce noise.
+_ORIGINAL_STDERR = sys.stderr
+_STDERR_DEVNULL = open(os.devnull, "w")
+sys.stderr = _STDERR_DEVNULL
+atexit.register(lambda: None if _STDERR_DEVNULL.closed else _STDERR_DEVNULL.close())
 os.environ["CURL_CFFI_LOG_LEVEL"] = "error"
 
 MODEL_NAME = 'granite4:7b-a1b-h'
 DEFAULT_MAX_STEPS = 12
 DEFAULT_TOOL_TIMEOUT_SEC = 20
+DEFAULT_TASK_RETRIES = 3
 DEFAULT_SWARM_WORKERS = 2
 DEFAULT_SWARM_MAX_REVIEWS = 2
 
@@ -57,6 +64,8 @@ WORKER_PROMPT_PROFILES = {
         "and concrete wording changes."
     ),
 }
+
+_TOOL_LOAD_WARNINGS_EMITTED = set()
 
 
 def short_text(value, max_len=240):
@@ -426,6 +435,7 @@ def derive_role_hint_from_text(text):
 
 class SwarmTui:
     def __init__(self, agent_ids, endpoint_name, model_name):
+        self._lock = threading.Lock()
         self.endpoint_name = endpoint_name
         self.model_name = model_name
         now = time.time()
@@ -490,48 +500,12 @@ class SwarmTui:
             self.view_mode = "dashboard"
 
     def handle_event(self, event, supervisor):
-        now = time.time()
-        agent_id = event.get("agent_id")
-        if agent_id and agent_id not in self.processes:
-            self.processes[agent_id] = {
-                "role": event.get("role", "unknown"),
-                "pid": "-",
-                "state": "registered",
-                "restarts": 0,
-                "last_heartbeat": None,
-                "heartbeat_count": 0,
-                "last_seen": now,
-                "total_tokens": 0,
-            }
-
-        if agent_id:
-            info = self.processes[agent_id]
-            info["role"] = event.get("role", info["role"])
-            info["last_seen"] = now
-
-            if event.get("event") == "heartbeat":
-                info["last_heartbeat"] = now
-                info["heartbeat_count"] += 1
-            elif event.get("event") == "process_started":
-                info["pid"] = event.get("pid", info["pid"])
-                info["state"] = "running"
-            elif event.get("event") in {"process_exiting", "process_shutdown_complete"}:
-                info["state"] = "stopped"
-            elif event.get("event") in {"process_died", "process_killed"}:
-                info["state"] = "failed"
-
-            if event.get("msg") in {"planning_completed", "task_completed", "review_completed", "synthesis_completed"}:
-                summary = event.get("summary") or event.get("details")
-                if summary:
-                    self._append_reasoning(agent_id, summary)
-
-        # Pull restart/state info from supervisor truth.
-        for worker in supervisor.workers.values():
-            pid = worker.pid if worker.pid is not None else "-"
-            proc = self.processes.setdefault(
-                worker.spec.agent_id,
-                {
-                    "role": worker.spec.role,
+        with self._lock:
+            now = time.time()
+            agent_id = event.get("agent_id")
+            if agent_id and agent_id not in self.processes:
+                self.processes[agent_id] = {
+                    "role": event.get("role", "unknown"),
                     "pid": "-",
                     "state": "registered",
                     "restarts": 0,
@@ -539,127 +513,318 @@ class SwarmTui:
                     "heartbeat_count": 0,
                     "last_seen": now,
                     "total_tokens": 0,
-                },
-            )
-            proc["role"] = worker.spec.role
-            proc["pid"] = pid
-            proc["state"] = worker.state
-            proc["restarts"] = worker.restarts
+                }
 
-        if agent_id:
-            pt = int(event.get("prompt_tokens", 0) or 0)
-            ct = int(event.get("completion_tokens", 0) or 0)
-            tt = int(event.get("total_tokens", 0) or 0)
-            if tt > 0:
-                self.request_count += 1
-                self.processes[agent_id]["total_tokens"] += tt
-                self.token_totals["prompt_tokens"] += pt
-                self.token_totals["completion_tokens"] += ct
-                self.token_totals["total_tokens"] += tt
-            if event.get("event") == "worker_error":
-                self.error_count += 1
+            if agent_id:
+                info = self.processes[agent_id]
+                info["role"] = event.get("role", info["role"])
+                info["last_seen"] = now
 
-        if event.get("event") != "heartbeat":
-            self.events.append(self._event_line(event))
-            self.events = self.events[-80:]
+                if event.get("event") == "heartbeat":
+                    info["last_heartbeat"] = now
+                    info["heartbeat_count"] += 1
+                elif event.get("event") == "process_started":
+                    info["pid"] = event.get("pid", info["pid"])
+                    info["state"] = "running"
+                elif event.get("event") in {"process_exiting", "process_shutdown_complete"}:
+                    info["state"] = "stopped"
+                elif event.get("event") in {"process_died", "process_killed"}:
+                    info["state"] = "failed"
+
+                if event.get("msg") in {"planning_completed", "task_completed", "review_completed", "synthesis_completed"}:
+                    summary = event.get("summary") or event.get("details")
+                    if summary:
+                        self._append_reasoning(agent_id, summary)
+
+            # Pull restart/state info from supervisor truth.
+            for worker in supervisor.workers.values():
+                pid = worker.pid if worker.pid is not None else "-"
+                proc = self.processes.setdefault(
+                    worker.spec.agent_id,
+                    {
+                        "role": worker.spec.role,
+                        "pid": "-",
+                        "state": "registered",
+                        "restarts": 0,
+                        "last_heartbeat": None,
+                        "heartbeat_count": 0,
+                        "last_seen": now,
+                        "total_tokens": 0,
+                    },
+                )
+                proc["role"] = worker.spec.role
+                proc["pid"] = pid
+                proc["state"] = worker.state
+                proc["restarts"] = worker.restarts
+
+            if agent_id:
+                pt = int(event.get("prompt_tokens", 0) or 0)
+                ct = int(event.get("completion_tokens", 0) or 0)
+                tt = int(event.get("total_tokens", 0) or 0)
+                if tt > 0:
+                    self.request_count += 1
+                    self.processes[agent_id]["total_tokens"] += tt
+                    self.token_totals["prompt_tokens"] += pt
+                    self.token_totals["completion_tokens"] += ct
+                    self.token_totals["total_tokens"] += tt
+                if event.get("event") == "worker_error":
+                    self.error_count += 1
+
+            if event.get("event") != "heartbeat":
+                self.events.append(self._event_line(event))
+                self.events = self.events[-80:]
+
+    def snapshot(self):
+        with self._lock:
+            now = time.time()
+            process_rows = []
+            for agent_id in sorted(self.processes.keys()):
+                info = self.processes[agent_id]
+                hb = info.get("last_heartbeat")
+                hb_age = None if hb is None else round(now - hb, 2)
+                process_rows.append(
+                    {
+                        "agent_id": agent_id,
+                        "role": str(info.get("role", "unknown")),
+                        "pid": str(info.get("pid", "-")),
+                        "state": str(info.get("state", "unknown")),
+                        "restarts": int(info.get("restarts", 0)),
+                        "heartbeat_age_sec": hb_age,
+                        "heartbeat_count": int(info.get("heartbeat_count", 0)),
+                        "last_seen_age_sec": round(now - info.get("last_seen", now), 2),
+                        "total_tokens": int(info.get("total_tokens", 0)),
+                        "reasoning": list(self.reasoning.get(agent_id, [])[-3:]),
+                    }
+                )
+
+            return {
+                "endpoint": self.endpoint_name,
+                "model": self.model_name,
+                "view_mode": self.view_mode,
+                "request_count": self.request_count,
+                "error_count": self.error_count,
+                "token_totals": dict(self.token_totals),
+                "processes": process_rows,
+                "events": list(self.events[-30:]),
+            }
 
     def render(self):
-        now = time.time()
-        header = Panel(
-            (
-                f"Endpoint: {self.endpoint_name}    Model: {self.model_name}    View: {self.view_mode}"
-                f"    Tokens: {self.token_totals['total_tokens']} "
-                f"(prompt {self.token_totals['prompt_tokens']}, completion {self.token_totals['completion_tokens']})"
-                f"    Requests: {self.request_count}    Errors: {self.error_count}"
-            ),
-            title="Swarm Runtime",
-            border_style="green",
-        )
-
-        proc_table = Table(title="Processes", expand=True)
-        proc_table.add_column("Agent")
-        proc_table.add_column("Role")
-        proc_table.add_column("PID")
-        proc_table.add_column("State")
-        proc_table.add_column("Restarts")
-        proc_table.add_column("Heartbeat Age")
-        proc_table.add_column("Tokens")
-        for agent_id in sorted(self.processes.keys()):
-            info = self.processes[agent_id]
-            hb = info.get("last_heartbeat")
-            hb_age = "-" if hb is None else f"{now - hb:.1f}s"
-            proc_table.add_row(
-                agent_id,
-                str(info.get("role", "unknown")),
-                str(info.get("pid", "-")),
-                str(info.get("state", "unknown")),
-                str(info.get("restarts", 0)),
-                hb_age,
-                str(info.get("total_tokens", 0)),
+        with self._lock:
+            now = time.time()
+            header = Panel(
+                (
+                    f"Endpoint: {self.endpoint_name}    Model: {self.model_name}    View: {self.view_mode}"
+                    f"    Tokens: {self.token_totals['total_tokens']} "
+                    f"(prompt {self.token_totals['prompt_tokens']}, completion {self.token_totals['completion_tokens']})"
+                    f"    Requests: {self.request_count}    Errors: {self.error_count}"
+                ),
+                title="Swarm Runtime",
+                border_style="green",
             )
 
-        hb_table = Table(title="Heartbeats", expand=True)
-        hb_table.add_column("Agent")
-        hb_table.add_column("Count")
-        hb_table.add_column("Last Seen")
-        for agent_id in sorted(self.processes.keys()):
-            info = self.processes[agent_id]
-            last_seen = info.get("last_seen", now)
-            hb_table.add_row(
-                agent_id,
-                str(info.get("heartbeat_count", 0)),
-                f"{now - last_seen:.1f}s ago",
+            proc_table = Table(title="Processes", expand=True)
+            proc_table.add_column("Agent")
+            proc_table.add_column("Role")
+            proc_table.add_column("PID")
+            proc_table.add_column("State")
+            proc_table.add_column("Restarts")
+            proc_table.add_column("Heartbeat Age")
+            proc_table.add_column("Tokens")
+            for agent_id in sorted(self.processes.keys()):
+                info = self.processes[agent_id]
+                hb = info.get("last_heartbeat")
+                hb_age = "-" if hb is None else f"{now - hb:.1f}s"
+                proc_table.add_row(
+                    agent_id,
+                    str(info.get("role", "unknown")),
+                    str(info.get("pid", "-")),
+                    str(info.get("state", "unknown")),
+                    str(info.get("restarts", 0)),
+                    hb_age,
+                    str(info.get("total_tokens", 0)),
+                )
+
+            hb_table = Table(title="Heartbeats", expand=True)
+            hb_table.add_column("Agent")
+            hb_table.add_column("Count")
+            hb_table.add_column("Last Seen")
+            for agent_id in sorted(self.processes.keys()):
+                info = self.processes[agent_id]
+                last_seen = info.get("last_seen", now)
+                hb_table.add_row(
+                    agent_id,
+                    str(info.get("heartbeat_count", 0)),
+                    f"{now - last_seen:.1f}s ago",
+                )
+
+            reasoning_lines = []
+            for agent_id in sorted(self.reasoning.keys()):
+                notes = self.reasoning.get(agent_id, [])
+                if notes:
+                    reasoning_lines.append(f"{agent_id}:")
+                    for note in notes[-3:]:
+                        reasoning_lines.append(f"  - {note}")
+            reasoning_text = "\n".join(reasoning_lines) if reasoning_lines else "No reasoning summaries yet."
+            reasoning_panel = Panel(reasoning_text, title="Reasoning", border_style="magenta")
+
+            events_text = "\n".join(self.events[-20:]) if self.events else "No events yet."
+            events_panel = Panel(events_text, title="Recent Events", border_style="cyan")
+            shortcuts = Panel(
+                "[Tab] cycle view   [d] dashboard   [r] reasoning   [e] events   [p] processes   [q] quit",
+                border_style="yellow",
+                title="Shortcuts",
             )
 
-        reasoning_lines = []
-        for agent_id in sorted(self.reasoning.keys()):
-            notes = self.reasoning.get(agent_id, [])
-            if notes:
-                reasoning_lines.append(f"{agent_id}:")
-                for note in notes[-3:]:
-                    reasoning_lines.append(f"  - {note}")
-        reasoning_text = "\n".join(reasoning_lines) if reasoning_lines else "No reasoning summaries yet."
-        reasoning_panel = Panel(reasoning_text, title="Reasoning", border_style="magenta")
+            layout = Layout()
+            layout.split_column(
+                Layout(header, name="header", size=3),
+                Layout(name="body"),
+                Layout(shortcuts, name="shortcuts", size=3),
+            )
 
-        events_text = "\n".join(self.events[-20:]) if self.events else "No events yet."
-        events_panel = Panel(events_text, title="Recent Events", border_style="cyan")
-        shortcuts = Panel(
-            "[Tab] cycle view   [d] dashboard   [r] reasoning   [e] events   [p] processes   [q] quit",
-            border_style="yellow",
-            title="Shortcuts",
-        )
+            body = layout["body"]
+            if self.view_mode == "reasoning":
+                body.update(reasoning_panel)
+            elif self.view_mode == "events":
+                body.update(events_panel)
+            elif self.view_mode == "processes":
+                body.split_row(
+                    Layout(proc_table, name="proc", ratio=2),
+                    Layout(hb_table, name="hb", ratio=1),
+                )
+            else:
+                body.split_row(
+                    Layout(name="left", ratio=1),
+                    Layout(name="right", ratio=1),
+                )
+                body["left"].split_column(
+                    Layout(proc_table, name="proc"),
+                    Layout(hb_table, name="hb"),
+                )
+                body["right"].split_column(
+                    Layout(reasoning_panel, name="reason"),
+                    Layout(events_panel, name="events"),
+                )
+            return layout
 
-        layout = Layout()
-        layout.split_column(
-            Layout(header, name="header", size=3),
-            Layout(name="body"),
-            Layout(shortcuts, name="shortcuts", size=3),
-        )
+class SwarmWebDashboard:
+    def __init__(self, state, port):
+        self.state = state
+        self.port = int(port)
+        self.host = "127.0.0.1"
+        self._server = None
+        self._thread = None
 
-        body = layout["body"]
-        if self.view_mode == "reasoning":
-            body.update(reasoning_panel)
-        elif self.view_mode == "events":
-            body.update(events_panel)
-        elif self.view_mode == "processes":
-            body.split_row(
-                Layout(proc_table, name="proc", ratio=2),
-                Layout(hb_table, name="hb", ratio=1),
-            )
-        else:
-            body.split_row(
-                Layout(name="left", ratio=1),
-                Layout(name="right", ratio=1),
-            )
-            body["left"].split_column(
-                Layout(proc_table, name="proc"),
-                Layout(hb_table, name="hb"),
-            )
-            body["right"].split_column(
-                Layout(reasoning_panel, name="reason"),
-                Layout(events_panel, name="events"),
-            )
-        return layout
+    def _html(self):
+        return """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SimpleAgent Swarm Dashboard</title>
+<style>
+:root { --bg:#0e1116; --panel:#171b22; --muted:#8ea0b5; --fg:#e7edf5; --ok:#2fbf71; --warn:#f2c14e; --bad:#f26d6d; --line:#273042; }
+* { box-sizing:border-box; }
+body { margin:0; background:linear-gradient(160deg,#0c1018,#111a27); color:var(--fg); font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,sans-serif; }
+.wrap { max-width:1200px; margin:0 auto; padding:20px; display:grid; gap:16px; }
+.panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px; }
+h1 { margin:0 0 6px; font-size:18px; }
+.meta { color:var(--muted); font-size:13px; }
+.stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:8px; margin-top:8px; }
+.stat { background:#111723; border:1px solid var(--line); border-radius:8px; padding:10px; font-size:13px; }
+table { width:100%; border-collapse:collapse; font-size:13px; }
+th,td { text-align:left; padding:8px; border-bottom:1px solid var(--line); vertical-align:top; }
+th { color:#b4c3d3; font-weight:600; }
+.events { white-space:pre-wrap; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12px; line-height:1.4; max-height:280px; overflow:auto; }
+.state-running{ color:var(--ok); } .state-stopped{ color:var(--warn); } .state-failed{ color:var(--bad); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="panel">
+    <h1>Swarm Runtime</h1>
+    <div class="meta" id="meta">Loading...</div>
+    <div class="stats" id="stats"></div>
+  </div>
+  <div class="panel">
+    <h1>Processes</h1>
+    <table><thead><tr><th>Agent</th><th>Role</th><th>PID</th><th>State</th><th>Restarts</th><th>HB Age</th><th>HB Count</th><th>Tokens</th><th>Reasoning</th></tr></thead><tbody id="procRows"></tbody></table>
+  </div>
+  <div class="panel">
+    <h1>Recent Events</h1>
+    <div class="events" id="events"></div>
+  </div>
+</div>
+<script>
+function esc(v){return String(v??'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');}
+function fmtSec(v){return v==null?'-':`${Number(v).toFixed(1)}s`;}
+function render(s){
+  document.getElementById('meta').innerHTML = `Endpoint: <b>${esc(s.endpoint)}</b> | Model: <b>${esc(s.model)}</b> | View: <b>${esc(s.view_mode)}</b>`;
+  const t=s.token_totals||{};
+  const stats=[['Total Tokens',t.total_tokens||0],['Prompt Tokens',t.prompt_tokens||0],['Completion Tokens',t.completion_tokens||0],['Requests',s.request_count||0],['Errors',s.error_count||0]];
+  document.getElementById('stats').innerHTML = stats.map(([k,v])=>`<div class="stat"><div>${esc(k)}</div><div><b>${esc(v)}</b></div></div>`).join('');
+  const rows=(s.processes||[]).map(p=>{
+    const cls=`state-${(p.state||'').toLowerCase()}`;
+    const reason=(p.reasoning||[]).map(x=>`<div>${esc(x)}</div>`).join('');
+    return `<tr><td>${esc(p.agent_id)}</td><td>${esc(p.role)}</td><td>${esc(p.pid)}</td><td class="${cls}">${esc(p.state)}</td><td>${esc(p.restarts)}</td><td>${fmtSec(p.heartbeat_age_sec)}</td><td>${esc(p.heartbeat_count)}</td><td>${esc(p.total_tokens)}</td><td>${reason}</td></tr>`;
+  }).join('');
+  document.getElementById('procRows').innerHTML=rows || '<tr><td colspan="9">No process data yet.</td></tr>';
+  document.getElementById('events').innerHTML=(s.events||[]).map(esc).join('\\n') || 'No events yet.';
+}
+async function tick(){
+  try{
+    const r=await fetch('/api/state', {cache:'no-store'});
+    if(!r.ok) throw new Error(`HTTP ${r.status}`);
+    render(await r.json());
+  }catch(e){
+    document.getElementById('meta').textContent=`Dashboard unavailable: ${e.message}`;
+  }
+}
+tick();
+setInterval(tick, 1000);
+</script>
+</body></html>"""
+
+    def start(self):
+        dashboard = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path == "/api/state":
+                    body = json.dumps(dashboard.state.snapshot(), ensure_ascii=True).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                if self.path in {"/", "/index.html"}:
+                    body = dashboard._html().encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                self.send_error(404)
+
+            def log_message(self, *_args):
+                return
+
+        self._server = HTTPServer((self.host, self.port), Handler)
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        if self._server is not None:
+            self._server.shutdown()
+            self._server.server_close()
+            self._server = None
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+            self._thread = None
 
 
 class KeyboardController:
@@ -712,6 +877,8 @@ def swarm_planner_worker(
                     "role": "system",
                     "content": (
                         "You are a planning agent. Break the user goal into 1-5 concrete tasks. "
+                        "Plan out and balance competitive and coopertive tasks. "
+                        "Please explain yourself. And then plan."
                         "Return only valid JSON array. Preferred item schema: "
                         "{\"instruction\": string, \"role_hint\": one of [general,reliability,testing,security,docs], "
                         "\"prompt_template_id\": one of [general,reliability,testing,security,docs]}. "
@@ -804,8 +971,17 @@ def swarm_worker_worker(
         task_id = task.get("task_id", "task-unknown")
         instruction = task.get("instruction", "")
         prompt_template_id = str(task.get("prompt_template_id", task.get("role_hint", "general"))).strip().lower()
+        retry_count = int(task.get("retry_count", 0) or 0)
+        retry_context = str(task.get("retry_context", "") or "").strip()
         if prompt_template_id not in WORKER_PROMPT_PROFILES:
             prompt_template_id = "general"
+        worker_instruction = instruction
+        if retry_context:
+            worker_instruction = (
+                f"{instruction}\n\n"
+                f"Retry context:\n{retry_context}\n"
+                "Address the prior failure directly if possible."
+            )
         emit_event(
             event_queue,
             "worker_progress",
@@ -814,10 +990,12 @@ def swarm_worker_worker(
             task_id=task_id,
             msg="task_started",
             prompt_template_id=prompt_template_id,
+            retry_count=retry_count,
+            summary=retry_context if retry_context else None,
         )
         try:
             worker_result = run_worker_task_with_tools(
-                instruction=instruction,
+                instruction=worker_instruction,
                 model_name=model_name,
                 system_prompt=(
                     WORKER_PROMPT_PROFILES[prompt_template_id]
@@ -839,6 +1017,7 @@ def swarm_worker_worker(
                     "agent_id": agent_id,
                     "prompt_template_id": prompt_template_id,
                     "tool_calls_executed": worker_result.get("tool_calls_executed", 0),
+                    "retry_count": retry_count,
                 }
             )
             emit_event(
@@ -851,17 +1030,28 @@ def swarm_worker_worker(
                 summary=short_text(output, max_len=180),
                 prompt_template_id=prompt_template_id,
                 tool_calls_executed=worker_result.get("tool_calls_executed", 0),
+                retry_count=retry_count,
                 prompt_tokens=worker_tokens["prompt_tokens"],
                 completion_tokens=worker_tokens["completion_tokens"],
                 total_tokens=worker_tokens["total_tokens"],
             )
         except TimeoutError:
+            retry_reason = (
+                f"Attempt {retry_count + 1} hit the hard model timeout after {model_timeout_sec}s. "
+                f"The next worker can only retry once that blocking call unwinds and the coordinator requeues {task_id}."
+            )
             error_payload = {
                 "task_id": task_id,
                 "status": "error",
                 "output": f"worker model call exceeded {model_timeout_sec}s",
                 "agent_id": agent_id,
                 "prompt_template_id": prompt_template_id,
+                "instruction": instruction,
+                "retry_count": retry_count,
+                "retryable": True,
+                "retry_reason": retry_reason,
+                "role_hint": task.get("role_hint", prompt_template_id),
+                "created_by": task.get("created_by", "planner-1"),
             }
             result_queue.put(error_payload)
             emit_worker_error(
@@ -869,17 +1059,27 @@ def swarm_worker_worker(
                 agent_id=agent_id,
                 role="worker",
                 error_type="model_timeout",
-                details=f"worker model call exceeded {model_timeout_sec}s",
+                details=retry_reason,
                 task_id=task_id,
                 msg="task_timeout",
             )
         except Exception as err:  # noqa: BLE001
+            retry_reason = (
+                f"Attempt {retry_count + 1} failed before completion with: {err}. "
+                f"The next worker can only retry after this worker returns control and the coordinator requeues {task_id}."
+            )
             error_payload = {
                 "task_id": task_id,
                 "status": "error",
                 "output": str(err),
                 "agent_id": agent_id,
                 "prompt_template_id": prompt_template_id,
+                "instruction": instruction,
+                "retry_count": retry_count,
+                "retryable": True,
+                "retry_reason": retry_reason,
+                "role_hint": task.get("role_hint", prompt_template_id),
+                "created_by": task.get("created_by", "planner-1"),
             }
             result_queue.put(error_payload)
             emit_worker_error(
@@ -887,7 +1087,7 @@ def swarm_worker_worker(
                 agent_id=agent_id,
                 role="worker",
                 error_type="worker_error",
-                details=str(err),
+                details=retry_reason,
                 task_id=task_id,
                 msg="task_failed",
             )
@@ -936,6 +1136,8 @@ def swarm_critic_worker(
                         "role": "system",
                         "content": (
                             "You are a critic in an agent swarm. Evaluate if worker outputs satisfy the goal. "
+                            "Please explain yourself. And then give the response. "
+                            "Be sure that you expect the same from everyone.  "
                             "Return only JSON object with keys: status (pass|fail), feedback, summary, follow_up_tasks. "
                             "follow_up_tasks must be an array of concrete task strings when status=fail, otherwise []."
                         ),
@@ -1070,7 +1272,9 @@ def swarm_synthesizer_worker(
                     {
                         "role": "system",
                         "content": (
-                            "You are a synthesizer in an agent swarm. Create one cohesive final answer from approved "
+                            "You are a synthesizer in an agent swarm. "
+                            "Please explain yourself. And then answer the question"
+                            "Create one cohesive final answer from approved "
                             "worker outputs. Return only JSON object with keys: status (ok|error), final_answer, details."
                         ),
                     },
@@ -1192,7 +1396,9 @@ def run_swarm_mode(parsed_args, prompt_text):
 
     use_text_debug = parsed_args.debug and not parsed_args.tui
     use_tui = parsed_args.tui
-    tui = SwarmTui(list(supervisor.workers.keys()), parsed_args.endpoint, parsed_args.model) if use_tui else None
+    use_web = parsed_args.web
+    tui = SwarmTui(list(supervisor.workers.keys()), parsed_args.endpoint, parsed_args.model) if (use_tui or use_web) else None
+    web_dashboard = None
 
     if use_text_debug:
         print("SWARM MODE")
@@ -1200,6 +1406,15 @@ def run_swarm_mode(parsed_args, prompt_text):
         print(f"  model: {parsed_args.model}")
         print(f"  agents: planner-1, workers={parsed_args.swarm_workers}, critic-1, synthesizer-1")
         print(f"  max_steps: {parsed_args.max_steps}")
+
+    if use_web:
+        try:
+            web_dashboard = SwarmWebDashboard(tui, parsed_args.web_port)
+            web_dashboard.start()
+            print(f"Swarm web dashboard: http://127.0.0.1:{parsed_args.web_port}")
+        except OSError as err:
+            print(f"Error: could not start --web dashboard on port {parsed_args.web_port}: {err}")
+            return
 
     supervisor.start_all()
     live_context = Live(tui.render(), refresh_per_second=4, transient=False) if use_tui else nullcontext()
@@ -1213,7 +1428,7 @@ def run_swarm_mode(parsed_args, prompt_text):
         events = supervisor.drain_events()
         supervisor.check_workers()
         for event in events:
-            if use_tui:
+            if use_tui or use_web:
                 tui.handle_event(event, supervisor)
         if use_tui:
             live.update(tui.render())
@@ -1257,7 +1472,7 @@ def run_swarm_mode(parsed_args, prompt_text):
         if expected_count <= 0:
             return []
         batch_results = []
-        seen_task_ids = set()
+        completed_task_ids = set()
         deadline = time.time() + max(parsed_args.tool_timeout, 2) * max(expected_count, 1)
         while len(batch_results) < expected_count and time.time() < deadline:
             drain_lifecycle()
@@ -1267,16 +1482,48 @@ def run_swarm_mode(parsed_args, prompt_text):
                 continue
 
             task_id = result.get("task_id")
-            if task_id in seen_task_ids:
+            if task_id in completed_task_ids:
                 continue
-            seen_task_ids.add(task_id)
             if use_text_debug:
                 print(
                     f"  result: batch={label} task={task_id} status={result.get('status')} "
                     f"agent={result.get('agent_id')}"
                 )
             if result.get("status") != "done":
+                retry_count = int(result.get("retry_count", 0) or 0)
+                if result.get("retryable") and retry_count < parsed_args.task_retries:
+                    next_retry_count = retry_count + 1
+                    retry_context = (
+                        f"Retry {next_retry_count} of {parsed_args.task_retries} for {task_id}. "
+                        f"Previous attempt ended with: {result.get('output', 'unknown error')}. "
+                        f"{result.get('retry_reason', '')}".strip()
+                    )
+                    task_queue.put(
+                        {
+                            "task_id": task_id,
+                            "instruction": result.get("instruction", ""),
+                            "role_hint": result.get("role_hint", "general"),
+                            "prompt_template_id": result.get("prompt_template_id", "general"),
+                            "created_by": result.get("created_by", "planner-1"),
+                            "retry_count": next_retry_count,
+                            "retry_context": retry_context,
+                        }
+                    )
+                    emit_event(
+                        supervisor.event_queue,
+                        "worker_progress",
+                        agent_id="coordinator",
+                        role="coordinator",
+                        task_id=task_id,
+                        msg="task_requeued",
+                        retry_count=next_retry_count,
+                        summary=short_text(retry_context, max_len=180),
+                    )
+                    if use_text_debug:
+                        print(f"  retry: task={task_id} attempt={next_retry_count}/{parsed_args.task_retries}")
+                    continue
                 return None, f"Worker error on {task_id}: {result.get('output', 'unknown error')}"
+            completed_task_ids.add(task_id)
             batch_results.append(result)
             final_results.append(result)
 
@@ -1410,13 +1657,16 @@ def run_swarm_mode(parsed_args, prompt_text):
         finally:
             supervisor.shutdown()
             final_events = supervisor.drain_events()
-            if use_tui:
+            if use_tui or use_web:
                 for event in final_events:
                     tui.handle_event(event, supervisor)
+            if use_tui:
                 live.update(tui.render())
             if use_text_debug:
                 for event in final_events:
                     print(f"  lifecycle: {event.get('event', 'unknown')} agent={event.get('agent_id', 'n/a')}")
+            if web_dashboard is not None:
+                web_dashboard.stop()
 
     output_payload = build_swarm_output_payload(
         parsed_args=parsed_args,
@@ -1458,7 +1708,14 @@ def load_tools():
                 module_name = f[:-3]
                 spec = importlib.util.spec_from_file_location(module_name, os.path.join(TOOLS_DIR, f))
                 module = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(module)
+                try:
+                    spec.loader.exec_module(module)
+                except Exception as err:  # noqa: BLE001
+                    warning = f"Warning: skipped tool '{module_name}' because it failed to load: {err}"
+                    if warning not in _TOOL_LOAD_WARNINGS_EMITTED:
+                        _TOOL_LOAD_WARNINGS_EMITTED.add(warning)
+                        print(warning)
+                    continue
                 
                 if hasattr(module, 'SCHEMA'):
                     # Ensure the tool name in schema matches the filename for consistent lookup
@@ -1482,6 +1739,8 @@ Usage examples:
     parser.add_argument('--debug', '-d', action='store_true', help='Show debug output (reasoning and tool calls)')
     parser.add_argument('--swarm', action='store_true', help='Run planner/worker swarm mode')
     parser.add_argument('--tui', action='store_true', help='Show swarm dashboard UI (processes, heartbeats, events)')
+    parser.add_argument('--web', action='store_true', help='Serve swarm dashboard at http://127.0.0.1:<port>')
+    parser.add_argument('--web-port', type=int, default=8765, help='Port used by --web dashboard server')
     parser.add_argument('--swarm-workers', type=int, default=DEFAULT_SWARM_WORKERS, help='Number of swarm worker processes')
     parser.add_argument('--swarm-max-reviews', type=int, default=DEFAULT_SWARM_MAX_REVIEWS, help='Maximum critic review rounds')
     parser.add_argument('--output-format', choices=['markdown', 'json'], default='markdown', help='Final output format')
@@ -1489,8 +1748,13 @@ Usage examples:
     parser.add_argument('--model', default=MODEL_NAME, help='Model name to use for inference')
     parser.add_argument('--max-steps', type=int, default=DEFAULT_MAX_STEPS, help='Maximum agent loop iterations')
     parser.add_argument('--tool-timeout', type=int, default=DEFAULT_TOOL_TIMEOUT_SEC, help='Per-tool timeout in seconds')
+    parser.add_argument('--task-retries', type=int, default=DEFAULT_TASK_RETRIES, help='Retries per swarm task after worker timeout/error')
     parser.add_argument('prompt', nargs='*', help='Prompt to send to the model')
-    parsed_args = parser.parse_args()
+    sys.stderr = _ORIGINAL_STDERR
+    try:
+        parsed_args = parser.parse_args()
+    finally:
+        sys.stderr = _STDERR_DEVNULL
 
     # Lock tool writes to the launch directory (project/workspace root).
     os.environ["SIMPLEAGENT_WORKSPACE_ROOT"] = os.path.abspath(os.getcwd())
@@ -1532,16 +1796,25 @@ Usage examples:
         if parsed_args.tui and not RICH_AVAILABLE:
             print("Error: --tui requires the 'rich' package. Install it with: pip install rich")
             return
+        if parsed_args.web_port < 1 or parsed_args.web_port > 65535:
+            print("Error: --web-port must be between 1 and 65535")
+            return
         if parsed_args.swarm_workers < 1:
             print("Error: --swarm-workers must be >= 1")
             return
         if parsed_args.swarm_max_reviews < 1:
             print("Error: --swarm-max-reviews must be >= 1")
             return
+        if parsed_args.task_retries < 0:
+            print("Error: --task-retries must be >= 0")
+            return
         run_swarm_mode(parsed_args, user_input)
         return
     if parsed_args.tui:
         print("Error: --tui can only be used with --swarm")
+        return
+    if parsed_args.web:
+        print("Error: --web can only be used with --swarm")
         return
 
     messages = [

@@ -1,0 +1,68 @@
+name: Security Linting
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+jobs:
+  security-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Install Snyk and Trivy for dependency and image scanning
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm install -g snyk trivy
+      - name: Check Python Dependencies
+        run: pip list | grep -E 'pandas|numpy|scipy' && echo "Dependencies OK"
+      - name: Scan Docker Image for Vulnerabilities
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ github.repository }}
+          format: table
+          exit-code: '0'
+      # Run linting checks on scripts and configuration files
+      - name: Check Python Scripts with Flake8
+        run: flake8 . --count --select=E9,F63,F7,F82,R170,E226,E302,E711,E116,W391 && echo "Flake8 OK"
+      - name: Scan for Secrets (GitLeaks)
+        uses: zricethezav/gitleaks-action@v2
+        with:
+          config-url: https://raw.githubusercontent.com/zricethezav/gitleaks/master/.gitleaksrc
+      - name: Check Dockerfile for Hardcoded Secrets
+        run: grep -R 'echo .*' Dockerfile | grep -v '.env'
+      # Add additional security checks as needed (e.g., Bandit, SAST tools)
+name: Security Linting
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+jobs:
+  security-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Install Snyk and Trivy for dependency and image scanning
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm install -g snyk trivy
+      - name: Check Python Dependencies
+        run: pip list | grep -E 'pandas|numpy|scipy' && echo "Dependencies OK"
+      - name: Scan Docker Image for Vulnerabilities
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ github.repository }}
+          format: table
+          exit-code: '0'
+      # Run linting checks on scripts and configuration files
+      - name: Check Python Scripts with Flake8
+        run: flake8 . --count --select=E9,F63,F7,F82,R170,E226,E302,E711,E116,W391 && echo "Flake8 OK"
+      - name: Scan for Secrets (GitLeaks)
+        uses: zricethezav/gitleaks-action@v2
+        with:
+          config-url: https://raw.githubusercontent.com/zricethezav/gitleaks/master/.gitleaksrc
+      - name: Check Dockerfile for Hardcoded Secrets
+        run: grep -R 'echo .*' Dockerfile | grep -v '.env'
+      # Add additional security checks as needed (e.g., Bandit, SAST tools)

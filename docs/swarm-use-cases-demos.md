@@ -6,6 +6,12 @@ This file contains practical, high-value demos for:
 python3 lm --swarm --tui --endpoint ollama --model granite4:7b-a1b-h --swarm-workers 3 --swarm-max-reviews 3 --tool-timeout 90 --output-format markdown "..."
 ```
 
+Or browser dashboard mode:
+
+```bash
+python3 lm --swarm --web --web-port 8765 --endpoint ollama --model granite4:7b-a1b-h --swarm-workers 3 --swarm-max-reviews 3 --tool-timeout 90 --output-format markdown "..."
+```
+
 ## Full Parameter Baseline
 
 ```bash
@@ -16,6 +22,10 @@ Use this as the default shape for all swarm demos.
 
 ```bash
 BASE="python3 lm --swarm --tui --endpoint ollama --model granite4:7b-a1b-h --swarm-workers 3 --swarm-max-reviews 3 --tool-timeout 90 --output-format markdown"
+```
+
+```bash
+BASE_WEB="python3 lm --swarm --web --web-port 8765 --endpoint ollama --model granite4:7b-a1b-h --swarm-workers 3 --swarm-max-reviews 3 --tool-timeout 90 --output-format markdown"
 ```
 
 ## 1) Repo Reliability Audit
@@ -116,6 +126,7 @@ Best for:
 ## Tips
 - Keep prompts outcome-oriented: ask for ranked findings and concrete next actions.
 - Use `--tui` for live process/heartbeat/reasoning/event visibility while tuning runs.
+- Use `--web` when you want browser-based live visibility without installing `rich`.
 - Increase `--swarm-max-reviews` when prompts are broad or ambiguous.
 
 ## API-Ready Output
@@ -133,6 +144,15 @@ python3 lm --swarm --tui --endpoint ollama --model granite4:7b-a1b-h --swarm-wor
 ```
 
 Use this mode when you want live process/heartbeat/event visibility with keyboard shortcuts.
+
+## Web View
+
+```bash
+python3 lm --swarm --web --web-port 8765 --endpoint ollama --model granite4:7b-a1b-h --swarm-workers 3 --swarm-max-reviews 3 --tool-timeout 90 --output-format markdown "Audit this repo for reliability issues. Identify top 5 failure modes and prioritized fixes."
+```
+
+Open `http://127.0.0.1:8765` while the run is active.
+Use this mode when you want live visibility in a browser without `rich`.
 
 ## App Build Use Cases
 
